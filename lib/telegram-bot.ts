@@ -45,6 +45,24 @@ async function tg(method: string, params: any, timeoutMs = 35_000): Promise<any>
   }
 }
 
+async function tgSendDocument(chatId: number | string, filename: string, content: string, caption?: string): Promise<void> {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) throw new Error('Missing TELEGRAM_BOT_TOKEN');
+  const form = new FormData();
+  form.append('chat_id', String(chatId));
+  if (caption) form.append('caption', caption.slice(0, 1024));
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  form.append('document', blob, filename);
+  const response = await fetch(`${TG_API}/bot${token}/sendDocument`, {
+    method: 'POST',
+    body: form
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`tg.sendDocument HTTP ${response.status}: ${text.slice(0, 400)}`);
+  }
+}
+
 function allowedChatIds(): Set<string> {
   const ids = new Set<string>();
   const main = String(process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -139,10 +157,8 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
     const entry = await getMarketsCachedOrFetch();
     const { markets, pagesFetched, stoppedReason, totalCategories, totalUniqueMarketIds, fetchedAt, durationMs } = entry;
     let predictOnly = filterPredictOnly(markets);
-    const beforeTradeable = predictOnly.length;
-    // 默认只显示未结束的市场（用户要的是「现在能玩的 predict 独有」）
+    // 默认只显示未结束的市场
     predictOnly = predictOnly.filter((m) => m.tradeable);
-    const afterTradeable = predictOnly.length;
     if (onlyRewards) {
       predictOnly = predictOnly.filter((m) => m.hourlyRate > 0);
     }
@@ -155,25 +171,54 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
       });
       return;
     }
-    // TG 长消息 + rate limit，最多发 100 条避免 429
-    const MAX_DISPLAY = 100;
-    const totalFound = predictOnly.length;
-    let truncated = false;
-    if (predictOnly.length > MAX_DISPLAY) {
-      predictOnly = predictOnly.slice(0, MAX_DISPLAY);
-      truncated = true;
-    }
     void durationMs;
-    void beforeTradeable;
-    void afterTradeable;
+    void fetchedAt;
+    const totalFound = predictOnly.length;
     const totalPP = predictOnly.reduce((s, m) => s + (m.hourlyRate || 0), 0);
-    const truncatedLine = truncated ? `\n⚠️ 仅显示前 ${MAX_DISPLAY}/${totalFound}（按 PP/h 降序）。完整列表用网页 /predict-only 查看。` : '';
-    const header = `📊 Predict 独有市场${onlyRewards ? '（仅在派 PP）' : ''} · 显示 ${predictOnly.length}/${totalFound} 个（未结束）\n总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）${truncatedLine}\n`;
-    const items = predictOnly.map((m, i) => {
-      const remain = fmtRemaining(m.endMs);
-      return `${i + 1}. ${m.title || '(无标题)'}\n   PP/h: ${fmt(m.hourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}${m.category ? ` · ${m.category}` : ''}\n   ${predictMarketUrl(m)}`;
-    });
-    await sendInChunks(chatId, header, items);
+    const header = `📊 Predict 独有市场${onlyRewards ? '（仅在派 PP）' : ''} · 共 ${totalFound} 个（未结束）\n总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）\n`;
+
+    if (totalFound <= 30) {
+      // 少量直接发消息
+      const items = predictOnly.map((m, i) => {
+        const remain = fmtRemaining(m.endMs);
+        return `${i + 1}. ${m.title || '(无标题)'}\n   PP/h: ${fmt(m.hourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}${m.category ? ` · ${m.category}` : ''}\n   ${predictMarketUrl(m)}`;
+      });
+      await sendInChunks(chatId, header, items);
+    } else {
+      // 量多时：消息只发前 20 条 + 完整列表做附件
+      const top = predictOnly.slice(0, 20).map((m, i) => {
+        const remain = fmtRemaining(m.endMs);
+        return `${i + 1}. ${m.title || '(无标题)'}\n   PP/h: ${fmt(m.hourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}\n   ${predictMarketUrl(m)}`;
+      });
+      const previewText = `${header}\n📌 PP/h Top 20（完整 ${totalFound} 个见附件）\n\n${top.join('\n\n')}`;
+      await tg('sendMessage', { chat_id: chatId, text: previewText.slice(0, 3900), disable_web_page_preview: true });
+
+      // 附件：完整列表
+      const fileLines = [
+        `Predict 独有市场（未结束）`,
+        `生成时间: ${new Date().toLocaleString('zh-CN', { hour12: false })}`,
+        `共 ${totalFound} 个 · 总 PP/h = ${fmt(totalPP, 1)}`,
+        `（cached at ${fetchedAt}）`,
+        `${'='.repeat(60)}`,
+        ''
+      ];
+      for (let i = 0; i < predictOnly.length; i++) {
+        const m = predictOnly[i];
+        const remain = fmtRemaining(m.endMs);
+        const lines = [
+          `${i + 1}. ${m.title || '(无标题)'}`,
+          `   ID: ${m.id}  PP/h: ${fmt(m.hourlyRate, 1)}${remain ? '  剩余: ' + remain : ''}`,
+          `   分类: ${m.category || '-'}${m.categorySlug ? '  slug: ' + m.categorySlug : ''}`,
+          `   URL: ${predictMarketUrl(m)}`,
+          ''
+        ];
+        fileLines.push(lines.join('\n'));
+      }
+      const content = fileLines.join('\n');
+      const date = new Date().toISOString().slice(0, 10);
+      const filename = `predict-only-${onlyRewards ? 'rewards-' : ''}${date}.txt`;
+      await tgSendDocument(chatId, filename, content, `📎 ${totalFound} 个未结束的 predict 独有市场`);
+    }
   } catch (err) {
     await tg('sendMessage', {
       chat_id: chatId,

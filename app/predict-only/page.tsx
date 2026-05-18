@@ -123,15 +123,18 @@ export default function PredictOnlyPage() {
 
   const rows = useMemo(() => {
     const list = data?.predictOnly || [];
+    // 客户端再过滤一遍 tradeable（API 缓存里啥都有）
+    const tradeableFiltered = includeClosed ? list : list.filter((m) => m.tradeable);
     const keyword = search.trim().toLowerCase();
     const filtered = keyword
-      ? list.filter(
+      ? tradeableFiltered.filter(
           (m) =>
             m.title.toLowerCase().includes(keyword) ||
             m.id.includes(keyword) ||
-            (m.category || '').toLowerCase().includes(keyword)
+            (m.category || '').toLowerCase().includes(keyword) ||
+            (m.categorySlug || '').toLowerCase().includes(keyword)
         )
-      : list;
+      : tradeableFiltered;
     const sorted = [...filtered].sort((a, b) => {
       if (sortKey === 'title') {
         const av = a.title.toLowerCase();
@@ -150,10 +153,14 @@ export default function PredictOnlyPage() {
       return sortDesc ? bv - av : av - bv;
     });
     return sorted;
-  }, [data, search, sortKey, sortDesc]);
+  }, [data, search, sortKey, sortDesc, includeClosed]);
+
+  const openCount = useMemo(() => (data?.predictOnly || []).filter((m) => m.tradeable).length, [data]);
+  const closedCount = useMemo(() => (data?.predictOnly || []).filter((m) => !m.tradeable).length, [data]);
+  const ppCount = useMemo(() => (data?.predictOnly || []).filter((m) => m.tradeable && m.hourlyRate > 0).length, [data]);
 
   const totalHourlyRate = useMemo(
-    () => (data?.predictOnly || []).reduce((sum, m) => sum + (Number.isFinite(m.hourlyRate) ? m.hourlyRate : 0), 0),
+    () => (data?.predictOnly || []).filter((m) => m.tradeable).reduce((sum, m) => sum + (Number.isFinite(m.hourlyRate) ? m.hourlyRate : 0), 0),
     [data]
   );
 
@@ -183,11 +190,12 @@ export default function PredictOnlyPage() {
           </p>
         </div>
         <div className="heroCard">
-          <span>Predict 独有数量</span>
-          <strong>{data?.predictOnlyCount ?? '-'}</strong>
+          <span>Predict 独有 · 未结束</span>
+          <strong>{openCount.toLocaleString()}</strong>
           <small>
-            总抓取 {data?.totalMarkets ?? '-'}，其中 {data?.withPolymarketCount ?? '-'} 有 polymarket 映射<br />
-            总 PP/h：{fmtNumber(totalHourlyRate, 1)}
+            其中在派 PP：{ppCount}（总 PP/h：{fmtNumber(totalHourlyRate, 1)}）<br />
+            已结束：{closedCount.toLocaleString()} · 共 {data?.predictOnlyCount ?? '-'}<br />
+            全平台总抓取 {data?.totalMarkets ?? '-'}，{data?.withPolymarketCount ?? '-'} 有 polymarket 映射
           </small>
         </div>
       </section>
