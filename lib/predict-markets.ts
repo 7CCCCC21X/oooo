@@ -2,6 +2,13 @@ import { fetchJson } from './fetch-json';
 import type { PredictMarketSummary } from './types';
 
 const PREDICT_REST_BASE = 'https://api.predict.fun/v1';
+const PREDICT_WEB_BASE = 'https://predict.fun';
+
+export function predictMarketUrl(m: { id: string; slug?: string; categorySlug?: string }): string {
+  const slug = m.slug || m.categorySlug;
+  if (slug) return `${PREDICT_WEB_BASE}/market/${slug}`;
+  return `${PREDICT_WEB_BASE}/market/${m.id}`;
+}
 
 const CLOSED_STATUSES = new Set([
   'CLOSED',

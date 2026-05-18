@@ -78,9 +78,9 @@ function fmtTime(value?: string) {
 }
 
 function predictUrl(market: PredictMarketSummary) {
-  const slug = market.categorySlug || market.slug;
-  if (slug) return `https://predict.fun/markets/${slug}`;
-  return `https://predict.fun/markets/${market.id}`;
+  const slug = market.slug || market.categorySlug;
+  if (slug) return `https://predict.fun/market/${slug}`;
+  return `https://predict.fun/market/${market.id}`;
 }
 
 export default function PredictOnlyPage() {

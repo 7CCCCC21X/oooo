@@ -1,4 +1,4 @@
-import { fetchAllPredictMarkets, filterPredictOnly } from './predict-markets';
+import { fetchAllPredictMarkets, filterPredictOnly, predictMarketUrl } from './predict-markets';
 import { runMonitorCycle } from './monitor';
 import { loadPairs } from './pairs';
 
@@ -78,7 +78,8 @@ function fmtRemaining(endMs?: number | null): string {
 
 const MENU_KEYBOARD = {
   inline_keyboard: [
-    [{ text: '📊 Predict 独有市场 Top10 (按 PP/h)', callback_data: 'predict_only' }],
+    [{ text: '📊 Predict 独有市场（全部）', callback_data: 'predict_only_all' }],
+    [{ text: '💰 仅显示在派 PP 的', callback_data: 'predict_only_rewards' }],
     [{ text: '🚨 立即跑一次价差检查', callback_data: 'check_spreads' }],
     [{ text: 'ℹ️ 监控状态', callback_data: 'status' }, { text: '❓ 帮助', callback_data: 'help' }]
   ]
@@ -89,37 +90,58 @@ async function sendMenu(chatId: number | string, prefix = '') {
   await tg('sendMessage', { chat_id: chatId, text, reply_markup: MENU_KEYBOARD });
 }
 
-async function handlePredictOnly(chatId: number | string) {
-  await tg('sendMessage', { chat_id: chatId, text: '⏳ 正在拉 predict.fun 独有市场...' });
+async function sendInChunks(chatId: number | string, header: string, items: string[]) {
+  if (!items.length) {
+    await tg('sendMessage', { chat_id: chatId, text: header, disable_web_page_preview: true });
+    return;
+  }
+  const MAX = 3800;
+  let buf = header;
+  for (const item of items) {
+    const sep = buf ? '\n\n' : '';
+    if (buf.length + sep.length + item.length > MAX) {
+      await tg('sendMessage', { chat_id: chatId, text: buf, disable_web_page_preview: true });
+      buf = item;
+    } else {
+      buf += sep + item;
+    }
+  }
+  if (buf) {
+    await tg('sendMessage', { chat_id: chatId, text: buf, disable_web_page_preview: true });
+  }
+}
+
+async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
+  await tg('sendMessage', {
+    chat_id: chatId,
+    text: `⏳ 正在拉 predict.fun ${onlyRewards ? '在派 PP 的' : '全部'}独有市场...（可能需要 10-30 秒）`
+  });
   try {
-    const { markets, pagesFetched } = await fetchAllPredictMarkets({
-      hasActiveRewards: true,
+    const { markets, pagesFetched, stoppedReason } = await fetchAllPredictMarkets({
+      hasActiveRewards: onlyRewards,
       limit: 100,
-      maxPages: 10,
+      maxPages: 100,
       includeClosed: false
     });
     let predictOnly = filterPredictOnly(markets);
+    if (onlyRewards) {
+      predictOnly = predictOnly.filter((m) => m.hourlyRate > 0);
+    }
     predictOnly.sort((a, b) => (b.hourlyRate || 0) - (a.hourlyRate || 0));
-    const top = predictOnly.slice(0, 10);
-    if (!top.length) {
+    if (!predictOnly.length) {
       await tg('sendMessage', {
         chat_id: chatId,
-        text: `没找到 predict 独有市场。\n抓取了 ${pagesFetched} 页，总共 ${markets.length} 个市场，其中 ${markets.length - predictOnly.length} 个有 polymarket 映射。\n\n可能 hasActiveRewards 过滤太严，可以临时去掉。`
+        text: `没找到 predict 独有市场。\n抓取了 ${pagesFetched} 页（stop=${stoppedReason}），总共 ${markets.length} 个市场，其中 ${markets.length - filterPredictOnly(markets).length} 个有 polymarket 映射。`
       });
       return;
     }
-    const lines = top.map((m, i) => {
-      const url = m.categorySlug || m.slug ? `https://predict.fun/markets/${m.categorySlug || m.slug}` : `https://predict.fun/markets/${m.id}`;
-      const remain = fmtRemaining(m.endMs);
-      return `${i + 1}. ${m.title}\n   PP/h: ${fmt(m.hourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}\n   ${url}`;
-    });
     const totalPP = predictOnly.reduce((s, m) => s + (m.hourlyRate || 0), 0);
-    const header = `📊 Predict 独有市场 Top ${top.length}（按 PP/h 降序）\n共 ${predictOnly.length} 个独有市场，总 PP/h = ${fmt(totalPP, 1)}\n\n`;
-    await tg('sendMessage', {
-      chat_id: chatId,
-      text: (header + lines.join('\n\n')).slice(0, 3900),
-      disable_web_page_preview: true
+    const header = `📊 Predict 独有市场${onlyRewards ? '（仅在派 PP）' : ''} · 共 ${predictOnly.length} 个\n总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）\n`;
+    const items = predictOnly.map((m, i) => {
+      const remain = fmtRemaining(m.endMs);
+      return `${i + 1}. ${m.title || '(无标题)'}\n   PP/h: ${fmt(m.hourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}${m.category ? ` · ${m.category}` : ''}\n   ${predictMarketUrl(m)}`;
     });
+    await sendInChunks(chatId, header, items);
   } catch (err) {
     await tg('sendMessage', {
       chat_id: chatId,
@@ -182,7 +204,8 @@ async function handleHelp(chatId: number | string) {
     '🤖 命令列表',
     '',
     '/menu - 显示主菜单（按钮）',
-    '/predict_only - Predict 独有市场 Top10（按 PP/h）',
+    '/predict_only - Predict 独有市场全部（按 PP/h 降序）',
+    '/predict_only rewards - 仅显示在派 PP 的独有市场',
     '/check - 立即跑一次价差检查',
     '/status - 监控运行状态',
     '/help - 显示这条帮助',
@@ -192,7 +215,7 @@ async function handleHelp(chatId: number | string) {
   await tg('sendMessage', { chat_id: chatId, text });
 }
 
-async function handleCommand(chatId: number | string, command: string) {
+async function handleCommand(chatId: number | string, command: string, args: string[]) {
   const cmd = command.split('@')[0].trim().toLowerCase();
   switch (cmd) {
     case '/start':
@@ -200,9 +223,11 @@ async function handleCommand(chatId: number | string, command: string) {
       await sendMenu(chatId, '👋 欢迎使用 Predict-Poly 监控机器人。\n\n');
       return;
     case '/predict_only':
-    case '/predictonly':
-      await handlePredictOnly(chatId);
+    case '/predictonly': {
+      const onlyRewards = args.some((a) => a.toLowerCase() === 'rewards' || a.toLowerCase() === 'pp');
+      await handlePredictOnly(chatId, onlyRewards);
       return;
+    }
     case '/check':
     case '/spreads':
       await handleCheckSpreads(chatId);
@@ -229,7 +254,11 @@ async function handleCallback(query: TgCallbackQuery) {
   }
   switch (data) {
     case 'predict_only':
-      await handlePredictOnly(chatId);
+    case 'predict_only_all':
+      await handlePredictOnly(chatId, false);
+      break;
+    case 'predict_only_rewards':
+      await handlePredictOnly(chatId, true);
       break;
     case 'check_spreads':
       await handleCheckSpreads(chatId);
@@ -262,7 +291,8 @@ async function handleUpdate(update: TgUpdate) {
   }
   const text = msg.text.trim();
   if (text.startsWith('/')) {
-    await handleCommand(chatId, text.split(/\s+/)[0]);
+    const tokens = text.split(/\s+/);
+    await handleCommand(chatId, tokens[0], tokens.slice(1));
     return;
   }
   // non-command message → show menu
