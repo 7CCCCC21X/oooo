@@ -14,7 +14,7 @@ export async function GET(request: Request) {
       await fetchAllPredictMarketsViaCategories({
         includeClosed,
         limit: 100,
-        maxPages: 200
+        maxPages: 300
       });
     const matches = markets.filter((m) => {
       if (slug) {

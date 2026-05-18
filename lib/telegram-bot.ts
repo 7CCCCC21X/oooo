@@ -123,7 +123,7 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
   try {
     const { markets, pagesFetched, stoppedReason, totalCategories, totalUniqueMarketIds } = await fetchAllPredictMarketsViaCategories({
       limit: 100,
-      maxPages: onlyRewards ? 30 : 100,
+      maxPages: onlyRewards ? 100 : 300,
       includeClosed: !onlyRewards
     });
     let predictOnly = filterPredictOnly(markets);

@@ -15,7 +15,7 @@ export async function GET(request: Request) {
   const hasActiveRewards = url.searchParams.get('hasActiveRewards') === '1';
   const debug = url.searchParams.get('debug') === '1';
   const limit = Number(url.searchParams.get('limit') || '100');
-  const maxPages = Number(url.searchParams.get('maxPages') || '100');
+  const maxPages = Number(url.searchParams.get('maxPages') || '300');
   const minHourlyRate = Number(url.searchParams.get('minHourlyRate') || '0');
 
   try {
@@ -50,7 +50,7 @@ export async function GET(request: Request) {
       const r = await fetchAllPredictMarketsViaCategories({
         includeClosed,
         limit: Number.isFinite(limit) ? limit : 100,
-        maxPages: Number.isFinite(maxPages) ? maxPages : 100
+        maxPages: Number.isFinite(maxPages) ? maxPages : 300
       });
       markets = r.markets;
       pagesFetched = r.pagesFetched;
@@ -58,6 +58,8 @@ export async function GET(request: Request) {
       totalCategories = r.totalCategories;
       totalUniqueMarketIds = r.totalUniqueMarketIds;
       categoriesWithoutMarkets = r.categoriesWithoutMarkets;
+      paginationMode = 'categories-cursor';
+      totalUniqueIds = r.totalUniqueMarketIds; // alias for旧字段名兼容
       usedSource = 'categories';
     }
 
