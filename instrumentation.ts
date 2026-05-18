@@ -5,4 +5,6 @@ export async function register() {
   startBackgroundMonitor();
   const { startBotLongPolling } = await import('./lib/telegram-bot');
   startBotLongPolling();
+  const { startBackgroundCacheRefresh } = await import('./lib/predict-cache');
+  startBackgroundCacheRefresh();
 }

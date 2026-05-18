@@ -1,8 +1,8 @@
 import {
-  fetchAllPredictMarketsViaCategories,
   filterPredictOnly,
   predictMarketUrl
 } from './predict-markets';
+import { getCacheStatus, getMarketsCachedOrFetch, refreshMarketsCache } from './predict-cache';
 import { runMonitorCycle } from './monitor';
 import { loadPairs } from './pairs';
 
@@ -84,10 +84,16 @@ const MENU_KEYBOARD = {
   inline_keyboard: [
     [{ text: '📊 Predict 独有市场（全部）', callback_data: 'predict_only_all' }],
     [{ text: '💰 仅显示在派 PP 的', callback_data: 'predict_only_rewards' }],
+    [{ text: '🔄 强制刷新缓存', callback_data: 'refresh_cache' }],
     [{ text: '🚨 立即跑一次价差检查', callback_data: 'check_spreads' }],
     [{ text: 'ℹ️ 监控状态', callback_data: 'status' }, { text: '❓ 帮助', callback_data: 'help' }]
   ]
 };
+
+async function handleRefreshCache(chatId: number | string) {
+  await tg('sendMessage', { chat_id: chatId, text: '🔄 已触发后台刷新缓存，60~180 秒后再点查询即可。' });
+  refreshMarketsCache().catch(() => {});
+}
 
 async function sendMenu(chatId: number | string, prefix = '') {
   const text = `${prefix}请选择操作：`;
@@ -116,16 +122,18 @@ async function sendInChunks(chatId: number | string, header: string, items: stri
 }
 
 async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
-  await tg('sendMessage', {
-    chat_id: chatId,
-    text: `⏳ 正在拉 predict.fun ${onlyRewards ? '在派 PP 的' : '全部'}独有市场...（遍历 categories，可能需要 30~60 秒）`
-  });
-  try {
-    const { markets, pagesFetched, stoppedReason, totalCategories, totalUniqueMarketIds } = await fetchAllPredictMarketsViaCategories({
-      limit: 100,
-      maxPages: onlyRewards ? 100 : 300,
-      includeClosed: !onlyRewards
+  const status = getCacheStatus();
+  if (!status.hasCache) {
+    await tg('sendMessage', {
+      chat_id: chatId,
+      text: '⏳ 首次拉取 predict.fun 全量市场缓存中...（一次性 60-180 秒，之后查询秒回）'
     });
+  } else if (status.ageMs && status.ageMs > (status.ttlMs || 600000)) {
+    await tg('sendMessage', { chat_id: chatId, text: '⏳ 使用缓存（已触发后台刷新）...' });
+  }
+  try {
+    const entry = await getMarketsCachedOrFetch();
+    const { markets, pagesFetched, stoppedReason, totalCategories, totalUniqueMarketIds, fetchedAt, durationMs } = entry;
     let predictOnly = filterPredictOnly(markets);
     if (onlyRewards) {
       predictOnly = predictOnly.filter((m) => m.hourlyRate > 0);
@@ -135,10 +143,11 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
       const withPoly = markets.length - filterPredictOnly(markets).length;
       await tg('sendMessage', {
         chat_id: chatId,
-        text: `没找到 predict 独有市场。\nsource: /v1/categories\n抓取: ${pagesFetched} 页 (stop=${stoppedReason})\n类目数: ${totalCategories}\n市场数: ${totalUniqueMarketIds}\n通过 tradeable 过滤: ${markets.length}\n其中 polymarket 映射: ${withPoly}`
+        text: `没找到 predict 独有市场。\nsource: /v1/categories (cached at ${fetchedAt})\n抓取: ${pagesFetched} 页 (stop=${stoppedReason})\n类目数: ${totalCategories}\n市场数: ${totalUniqueMarketIds}\n通过 tradeable 过滤: ${markets.length}\n其中 polymarket 映射: ${withPoly}`
       });
       return;
     }
+    void durationMs;
     const totalPP = predictOnly.reduce((s, m) => s + (m.hourlyRate || 0), 0);
     const header = `📊 Predict 独有市场${onlyRewards ? '（仅在派 PP）' : ''} · 共 ${predictOnly.length} 个\n总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）\n`;
     const items = predictOnly.map((m, i) => {
@@ -187,6 +196,7 @@ async function handleCheckSpreads(chatId: number | string) {
 
 async function handleStatus(chatId: number | string) {
   const pairs = loadPairs();
+  const cache = getCacheStatus();
   const lines = [
     `🟢 监控状态`,
     `进程内监控: ${globalThis.__spreadMonitorTimer ? '运行中' : '未启动'}`,
@@ -195,11 +205,17 @@ async function handleStatus(chatId: number | string) {
     `轮询间隔: ${process.env.MONITOR_INTERVAL_MS || '60000'} ms`,
     `阈值: ${process.env.ALERT_THRESHOLD || '0.015'}`,
     `Cooldown: ${process.env.ALERT_COOLDOWN_SEC || '300'} s`,
-    `最近一次 cycle: ${globalThis.__tgBotLastCycleAt || '(尚未记录)'}`
+    `最近一次 cycle: ${globalThis.__tgBotLastCycleAt || '(尚未记录)'}`,
+    '',
+    `📦 Predict 市场缓存`,
+    `状态: ${cache.hasCache ? '✅ 已缓存' : '⏳ 未缓存'}${cache.refreshInflight ? '（刷新中）' : ''}`,
+    `市场数: ${cache.totalMarkets}`,
+    `类目数: ${cache.totalCategories}`,
+    `抓取: ${cache.pagesFetched} 页, ${cache.durationMs}ms, stop=${cache.stoppedReason}`,
+    `更新于: ${cache.fetchedAt || '(尚未)'}（${cache.ageMs == null ? '-' : Math.round(cache.ageMs / 1000) + 's 前'}）`
   ];
-  if (globalThis.__tgBotLastError) {
-    lines.push(`最近错误: ${globalThis.__tgBotLastError}`);
-  }
+  if (cache.lastError) lines.push(`缓存错误: ${cache.lastError}`);
+  if (globalThis.__tgBotLastError) lines.push(`Bot 错误: ${globalThis.__tgBotLastError}`);
   await tg('sendMessage', { chat_id: chatId, text: lines.join('\n') });
 }
 
@@ -236,6 +252,9 @@ async function handleCommand(chatId: number | string, command: string, args: str
     case '/spreads':
       await handleCheckSpreads(chatId);
       return;
+    case '/refresh':
+      await handleRefreshCache(chatId);
+      return;
     case '/status':
       await handleStatus(chatId);
       return;
@@ -263,6 +282,9 @@ async function handleCallback(query: TgCallbackQuery) {
       break;
     case 'predict_only_rewards':
       await handlePredictOnly(chatId, true);
+      break;
+    case 'refresh_cache':
+      await handleRefreshCache(chatId);
       break;
     case 'check_spreads':
       await handleCheckSpreads(chatId);
@@ -308,9 +330,10 @@ async function registerCommandsMenu() {
     await tg('setMyCommands', {
       commands: [
         { command: 'menu', description: '主菜单' },
-        { command: 'predict_only', description: 'Predict 独有市场 Top10' },
+        { command: 'predict_only', description: 'Predict 独有市场（全部）' },
+        { command: 'refresh', description: '强制刷新缓存' },
         { command: 'check', description: '立即跑一次价差检查' },
-        { command: 'status', description: '监控状态' },
+        { command: 'status', description: '监控/缓存状态' },
         { command: 'help', description: '帮助' }
       ]
     });
