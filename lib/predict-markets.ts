@@ -263,6 +263,8 @@ export async function fetchAllPredictMarkets(options: FetchOptions = {}): Promis
   pagesFetched: number;
   stoppedReason: string;
   sampleRaw?: unknown;
+  rawWrapperKeys?: string[];
+  paginationMode?: string;
 }> {
   const apiKey = process.env.PREDICT_API_KEY;
   const headers: Record<string, string> = { Accept: 'application/json' };
@@ -273,22 +275,37 @@ export async function fetchAllPredictMarkets(options: FetchOptions = {}): Promis
   const includeClosed = options.includeClosed ?? false;
   const hasActiveRewards = options.hasActiveRewards ?? false;
 
+  // hasActiveRewards=true 时 REST 的 ?after=<id> 游标分页有效；
+  // 全量时只能用 offset，因为 ?after=<id> 会返回同一页。
+  const paginationMode: 'cursor' | 'offset' = hasActiveRewards ? 'cursor' : 'offset';
+
   const all: PredictMarketSummary[] = [];
   const seen = new Set<string>();
   let lastId: string | null = null;
+  let offset = 0;
   let pagesFetched = 0;
   let stoppedReason = 'exhausted';
   let sampleRaw: unknown = undefined;
+  let rawWrapperKeys: string[] | undefined = undefined;
 
   while (pagesFetched < maxPages) {
-    const params = new URLSearchParams({ first: String(limit) });
-    if (lastId != null) params.set('after', String(lastId));
-    if (hasActiveRewards) params.set('hasActiveRewards', 'true');
+    const params = new URLSearchParams();
+    if (paginationMode === 'cursor') {
+      params.set('first', String(limit));
+      if (lastId != null) params.set('after', String(lastId));
+      params.set('hasActiveRewards', 'true');
+    } else {
+      params.set('limit', String(limit));
+      params.set('offset', String(offset));
+    }
 
     const url = `${PREDICT_REST_BASE}/markets?${params.toString()}`;
     const raw = await fetchJson(url, { headers });
     pagesFetched += 1;
 
+    if (!rawWrapperKeys && raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      rawWrapperKeys = Object.keys(raw as object);
+    }
     const rows = pickArray(raw);
     if (!sampleRaw && rows.length) sampleRaw = rows[0];
     if (!rows.length) {
@@ -297,45 +314,41 @@ export async function fetchAllPredictMarkets(options: FetchOptions = {}): Promis
     }
 
     let added = 0;
-    let totalRows = 0;
-    let filteredOutNonTradeable = 0;
     let newLast: string | null = null;
     for (const row of rows) {
       const r = row as any;
       const id = String(r?.id ?? r?.marketId ?? r?.market_id ?? '').trim();
       if (!id) continue;
-      totalRows += 1;
       newLast = id;
       if (seen.has(id)) continue;
       const summary = normalizeMarket(r);
-      if (!includeClosed && !summary.tradeable) {
-        filteredOutNonTradeable += 1;
-        continue;
-      }
+      if (!includeClosed && !summary.tradeable) continue;
       seen.add(id);
       all.push(summary);
       added += 1;
     }
 
-    if (!newLast || newLast === lastId) {
-      stoppedReason = 'no-cursor-progress';
-      break;
+    if (paginationMode === 'cursor') {
+      if (!newLast || newLast === lastId) {
+        stoppedReason = 'no-cursor-progress';
+        break;
+      }
+      lastId = newLast;
+    } else {
+      offset += rows.length;
     }
-    lastId = newLast;
     if (rows.length < limit) {
       stoppedReason = 'short-page';
       break;
     }
-    // NOTE: 不要在 added === 0 时退出。第一页常常全是已结束市场，
-    // 但后面的页里有可交易的。继续翻直到 cursor 不动或 short-page。
-    void filteredOutNonTradeable;
+    void added;
   }
 
   if (pagesFetched >= maxPages && stoppedReason === 'exhausted') {
     stoppedReason = `hit-max-pages-${maxPages}`;
   }
 
-  return { markets: all, pagesFetched, stoppedReason, sampleRaw };
+  return { markets: all, pagesFetched, stoppedReason, sampleRaw, rawWrapperKeys, paginationMode };
 }
 
 export function filterPredictOnly(markets: PredictMarketSummary[]): PredictMarketSummary[] {

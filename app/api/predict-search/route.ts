@@ -10,7 +10,7 @@ export async function GET(request: Request) {
   const slug = (url.searchParams.get('slug') || '').trim().toLowerCase();
   const includeClosed = url.searchParams.get('includeClosed') !== '0';
   try {
-    const { markets, pagesFetched } = await fetchAllPredictMarkets({
+    const { markets, pagesFetched, stoppedReason, paginationMode, rawWrapperKeys, sampleRaw } = await fetchAllPredictMarkets({
       includeClosed,
       hasActiveRewards: false,
       limit: 100,
@@ -25,9 +25,13 @@ export async function GET(request: Request) {
     return NextResponse.json({
       ok: true,
       query: { q, slug, includeClosed },
+      paginationMode,
       pagesFetched,
+      stoppedReason,
       totalMarkets: markets.length,
       matchCount: matches.length,
+      rawWrapperKeys,
+      sampleRawKeys: sampleRaw && typeof sampleRaw === 'object' ? Object.keys(sampleRaw as object) : null,
       matches
     });
   } catch (error) {
