@@ -7,17 +7,23 @@ export const revalidate = 0;
 export async function GET(request: Request) {
   const url = new URL(request.url);
   const includeClosed = url.searchParams.get('includeClosed') === '1';
+  const hasActiveRewards = url.searchParams.get('hasActiveRewards') === '1';
+  const debug = url.searchParams.get('debug') === '1';
   const limit = Number(url.searchParams.get('limit') || '100');
   const maxPages = Number(url.searchParams.get('maxPages') || '50');
-  const status = url.searchParams.get('status') || undefined;
+  const minHourlyRate = Number(url.searchParams.get('minHourlyRate') || '0');
+
   try {
-    const { markets, pagesFetched, stoppedReason } = await fetchAllPredictMarkets({
+    const { markets, pagesFetched, stoppedReason, sampleRaw } = await fetchAllPredictMarkets({
       includeClosed,
+      hasActiveRewards,
       limit: Number.isFinite(limit) ? limit : 100,
-      maxPages: Number.isFinite(maxPages) ? maxPages : 50,
-      status: status || undefined
+      maxPages: Number.isFinite(maxPages) ? maxPages : 50
     });
-    const predictOnly = filterPredictOnly(markets);
+    let predictOnly = filterPredictOnly(markets);
+    if (Number.isFinite(minHourlyRate) && minHourlyRate > 0) {
+      predictOnly = predictOnly.filter((m) => m.hourlyRate >= minHourlyRate);
+    }
     const withPoly = markets.filter((m) => m.hasPolymarket);
     return NextResponse.json({
       ok: true,
@@ -27,8 +33,15 @@ export async function GET(request: Request) {
       totalMarkets: markets.length,
       withPolymarketCount: withPoly.length,
       predictOnlyCount: predictOnly.length,
+      filters: { includeClosed, hasActiveRewards, minHourlyRate, limit, maxPages },
       predictOnly,
-      withPolymarket: withPoly.map((m) => ({ id: m.id, title: m.title, polymarketConditionIds: m.polymarketConditionIds }))
+      withPolymarket: withPoly.map((m) => ({
+        id: m.id,
+        title: m.title,
+        hourlyRate: m.hourlyRate,
+        polymarketConditionIds: m.polymarketConditionIds
+      })),
+      ...(debug ? { sampleRaw } : {})
     });
   } catch (error) {
     return NextResponse.json(

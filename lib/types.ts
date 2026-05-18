@@ -57,17 +57,27 @@ export type ResolveResult = {
 export type PredictMarketSummary = {
   id: string;
   title: string;
+  question?: string;
   slug?: string;
+  categorySlug?: string;
   status?: string;
+  tradingStatus?: string;
+  isResolved?: boolean;
   closed?: boolean;
   active?: boolean;
   category?: string;
   endDate?: string;
+  endMs?: number | null;
   volume?: number;
   liquidity?: number;
   yesPrice?: number | null;
   noPrice?: number | null;
+  hourlyRate: number;
+  hourlyRateSource?: 'current' | 'schedule' | 'recursive' | 'none';
+  spreadThreshold?: number;
+  shareThreshold?: number;
   polymarketConditionIds: string[];
   hasPolymarket: boolean;
+  tradeable: boolean;
   raw?: unknown;
 };
