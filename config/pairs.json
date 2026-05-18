@@ -1,0 +1,22 @@
+[
+  {
+    "name": "52261 $1,000",
+    "predictMarketId": "52261",
+    "predictSide": "Yes",
+    "polymarketConditionId": "0x094725e5691f06b1895496ab0823b3f843c3be680f870cb721958d4e4d280a55",
+    "polymarketOutcome": "$1,000",
+    "polymarketTokenId": "103597772619771602279133713717413925259840477497073497777483261154645161253638",
+    "threshold": 0.015,
+    "minSize": 0
+  },
+  {
+    "name": "52261 $3,000",
+    "predictMarketId": "52261",
+    "predictSide": "No",
+    "polymarketConditionId": "0x094725e5691f06b1895496ab0823b3f843c3be680f870cb721958d4e4d280a55",
+    "polymarketOutcome": "$3,000",
+    "polymarketTokenId": "4760166089316344351949404133986847346176987275901006817985197202485921415799",
+    "threshold": 0.015,
+    "minSize": 0
+  }
+]
