@@ -14,7 +14,7 @@ export async function GET(request: Request) {
   const minHourlyRate = Number(url.searchParams.get('minHourlyRate') || '0');
 
   try {
-    const { markets, pagesFetched, stoppedReason, sampleRaw } = await fetchAllPredictMarkets({
+    const { markets, pagesFetched, stoppedReason, sampleRaw, rawWrapperKeys, paginationMode, totalUniqueIds } = await fetchAllPredictMarkets({
       includeClosed,
       hasActiveRewards,
       limit: Number.isFinite(limit) ? limit : 100,
@@ -30,6 +30,8 @@ export async function GET(request: Request) {
       checkedAt: new Date().toISOString(),
       pagesFetched,
       stoppedReason,
+      paginationMode,
+      totalUniqueIds,
       totalMarkets: markets.length,
       withPolymarketCount: withPoly.length,
       predictOnlyCount: predictOnly.length,
@@ -41,7 +43,7 @@ export async function GET(request: Request) {
         hourlyRate: m.hourlyRate,
         polymarketConditionIds: m.polymarketConditionIds
       })),
-      ...(debug ? { sampleRaw } : {})
+      ...(debug ? { sampleRaw, rawWrapperKeys } : {})
     });
   } catch (error) {
     return NextResponse.json(
