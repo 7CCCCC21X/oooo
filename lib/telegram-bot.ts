@@ -117,10 +117,10 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
     text: `⏳ 正在拉 predict.fun ${onlyRewards ? '在派 PP 的' : '全部'}独有市场...（可能需要 10-30 秒）`
   });
   try {
-    const { markets, pagesFetched, stoppedReason } = await fetchAllPredictMarkets({
+    const { markets, pagesFetched, stoppedReason, sampleRaw } = await fetchAllPredictMarkets({
       hasActiveRewards: onlyRewards,
       limit: 100,
-      maxPages: 100,
+      maxPages: onlyRewards ? 20 : 50,
       includeClosed: false
     });
     let predictOnly = filterPredictOnly(markets);
@@ -129,9 +129,11 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
     }
     predictOnly.sort((a, b) => (b.hourlyRate || 0) - (a.hourlyRate || 0));
     if (!predictOnly.length) {
+      const withPoly = markets.length - filterPredictOnly(markets).length;
+      const sampleKeys = sampleRaw && typeof sampleRaw === 'object' ? Object.keys(sampleRaw as object).slice(0, 12).join(', ') : '(none)';
       await tg('sendMessage', {
         chat_id: chatId,
-        text: `没找到 predict 独有市场。\n抓取了 ${pagesFetched} 页（stop=${stoppedReason}），总共 ${markets.length} 个市场，其中 ${markets.length - filterPredictOnly(markets).length} 个有 polymarket 映射。`
+        text: `没找到 predict 独有市场。\n抓取了 ${pagesFetched} 页（stop=${stoppedReason}）\n通过 tradeable 过滤的市场: ${markets.length}\n其中 polymarket 映射: ${withPoly}\nPredict 独有 (前过滤): ${markets.length - withPoly}\n\n首条原始字段名: ${sampleKeys}`
       });
       return;
     }

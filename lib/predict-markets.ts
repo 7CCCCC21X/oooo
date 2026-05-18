@@ -297,15 +297,21 @@ export async function fetchAllPredictMarkets(options: FetchOptions = {}): Promis
     }
 
     let added = 0;
+    let totalRows = 0;
+    let filteredOutNonTradeable = 0;
     let newLast: string | null = null;
     for (const row of rows) {
       const r = row as any;
       const id = String(r?.id ?? r?.marketId ?? r?.market_id ?? '').trim();
       if (!id) continue;
+      totalRows += 1;
       newLast = id;
       if (seen.has(id)) continue;
       const summary = normalizeMarket(r);
-      if (!includeClosed && !summary.tradeable) continue;
+      if (!includeClosed && !summary.tradeable) {
+        filteredOutNonTradeable += 1;
+        continue;
+      }
       seen.add(id);
       all.push(summary);
       added += 1;
@@ -315,16 +321,14 @@ export async function fetchAllPredictMarkets(options: FetchOptions = {}): Promis
       stoppedReason = 'no-cursor-progress';
       break;
     }
+    lastId = newLast;
     if (rows.length < limit) {
-      lastId = newLast;
       stoppedReason = 'short-page';
       break;
     }
-    if (added === 0) {
-      stoppedReason = 'no-new-items';
-      break;
-    }
-    lastId = newLast;
+    // NOTE: 不要在 added === 0 时退出。第一页常常全是已结束市场，
+    // 但后面的页里有可交易的。继续翻直到 cursor 不动或 short-page。
+    void filteredOutNonTradeable;
   }
 
   if (pagesFetched >= maxPages && stoppedReason === 'exhausted') {
