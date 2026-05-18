@@ -210,6 +210,7 @@ export function normalizeMarket(raw: any): PredictMarketSummary {
   const question = raw?.question ? String(raw.question) : undefined;
   const slug = raw?.slug || raw?.marketSlug ? String(raw.slug || raw.marketSlug) : undefined;
   const categorySlug = raw?.categorySlug || raw?.category_slug ? String(raw.categorySlug || raw.category_slug) : undefined;
+  const categoryTitle = raw?.categoryTitle || raw?.category_title ? String(raw.categoryTitle || raw.category_title) : undefined;
   const status = raw?.status ? String(raw.status) : undefined;
   const tradingStatus = raw?.tradingStatus ? String(raw.tradingStatus) : undefined;
   const isResolved = typeof raw?.isResolved === 'boolean' ? raw.isResolved : undefined;
@@ -229,6 +230,7 @@ export function normalizeMarket(raw: any): PredictMarketSummary {
     question,
     slug,
     categorySlug,
+    categoryTitle,
     status,
     tradingStatus,
     isResolved,
@@ -388,6 +390,42 @@ export async function fetchAllPredictMarkets(options: FetchOptions = {}): Promis
 
 export function filterPredictOnly(markets: PredictMarketSummary[]): PredictMarketSummary[] {
   return markets.filter((m) => !m.hasPolymarket);
+}
+
+export type MarketGroup = {
+  slug: string;
+  title: string;
+  markets: PredictMarketSummary[];
+  totalHourlyRate: number;
+  url: string;
+  endMs: number | null;
+};
+
+// 按 categorySlug 分组（同一个 event 的子市场合并）
+export function groupMarketsByCategory(markets: PredictMarketSummary[]): MarketGroup[] {
+  const map = new Map<string, PredictMarketSummary[]>();
+  for (const m of markets) {
+    const key = (m.categorySlug || m.slug || m.id || '').toLowerCase();
+    if (!key) continue;
+    const list = map.get(key) || [];
+    list.push(m);
+    map.set(key, list);
+  }
+  return Array.from(map.entries()).map(([slug, list]) => {
+    // 排序子市场让显示稳定：PP/h 降序
+    list.sort((a, b) => (b.hourlyRate || 0) - (a.hourlyRate || 0));
+    const first = list[0];
+    const title = first.categoryTitle || first.category || first.title || slug;
+    const ends = list.map((m) => m.endMs).filter((v): v is number => typeof v === 'number');
+    return {
+      slug,
+      title,
+      markets: list,
+      totalHourlyRate: list.reduce((s, m) => s + (m.hourlyRate || 0), 0),
+      url: predictMarketUrl(first),
+      endMs: ends.length ? Math.max(...ends) : null
+    };
+  });
 }
 
 // ============================================================

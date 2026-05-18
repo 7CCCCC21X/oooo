@@ -7,6 +7,7 @@ type PredictMarketSummary = {
   title: string;
   slug?: string;
   categorySlug?: string;
+  categoryTitle?: string;
   status?: string;
   tradingStatus?: string;
   isResolved?: boolean;
@@ -26,6 +27,15 @@ type PredictMarketSummary = {
   polymarketConditionIds: string[];
   hasPolymarket: boolean;
   tradeable: boolean;
+};
+
+type EventGroup = {
+  slug: string;
+  title: string;
+  url: string;
+  totalHourlyRate: number;
+  endMs: number | null;
+  markets: PredictMarketSummary[];
 };
 
 type ApiResponse = {
@@ -93,6 +103,7 @@ export default function PredictOnlyPage() {
   const [search, setSearch] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('hourlyRate');
   const [sortDesc, setSortDesc] = useState(true);
+  const [groupByEvent, setGroupByEvent] = useState(true);
   const [limit, setLimit] = useState(100);
   const [maxPages, setMaxPages] = useState(50);
 
@@ -164,6 +175,44 @@ export default function PredictOnlyPage() {
     [data]
   );
 
+  const groups: EventGroup[] = useMemo(() => {
+    if (!groupByEvent) return [];
+    const map = new Map<string, PredictMarketSummary[]>();
+    for (const m of rows) {
+      const key = (m.categorySlug || m.slug || m.id || '').toLowerCase();
+      if (!key) continue;
+      const list = map.get(key) || [];
+      list.push(m);
+      map.set(key, list);
+    }
+    const result: EventGroup[] = Array.from(map.entries()).map(([slug, list]) => {
+      list.sort((a, b) => (b.hourlyRate || 0) - (a.hourlyRate || 0));
+      const first = list[0];
+      const title = first.categoryTitle || first.category || first.title || slug;
+      const ends = list.map((m) => m.endMs).filter((v): v is number => typeof v === 'number');
+      const url = first.slug || first.categorySlug ? `https://predict.fun/market/${first.slug || first.categorySlug}` : `https://predict.fun/market/${first.id}`;
+      return {
+        slug,
+        title,
+        url,
+        totalHourlyRate: list.reduce((s, m) => s + (m.hourlyRate || 0), 0),
+        endMs: ends.length ? Math.max(...ends) : null,
+        markets: list
+      };
+    });
+    result.sort((a, b) => {
+      if (sortKey === 'hourlyRate') return sortDesc ? b.totalHourlyRate - a.totalHourlyRate : a.totalHourlyRate - b.totalHourlyRate;
+      if (sortKey === 'endMs') {
+        const av = a.endMs ?? 0;
+        const bv = b.endMs ?? 0;
+        return sortDesc ? bv - av : av - bv;
+      }
+      if (sortKey === 'title') return sortDesc ? b.title.localeCompare(a.title) : a.title.localeCompare(b.title);
+      return 0;
+    });
+    return result;
+  }, [rows, groupByEvent, sortKey, sortDesc]);
+
   function toggleSort(key: SortKey) {
     if (sortKey === key) {
       setSortDesc((v) => !v);
@@ -209,6 +258,10 @@ export default function PredictOnlyPage() {
         <label className="switch">
           <input type="checkbox" checked={includeClosed} onChange={(e) => setIncludeClosed(e.target.checked)} />
           包含已关闭
+        </label>
+        <label className="switch">
+          <input type="checkbox" checked={groupByEvent} onChange={(e) => setGroupByEvent(e.target.checked)} />
+          按 event 分组
         </label>
         <label>
           最小 PP/h
@@ -257,10 +310,68 @@ export default function PredictOnlyPage() {
         </div>
 
         <div className="filterRow">
-          <label>搜索 <input type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="标题、ID、分类..." /></label>
-          <span style={{ color: 'var(--muted)' }}>显示 {rows.length} / {data?.predictOnlyCount ?? 0}</span>
+          <label>搜索 <input type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="标题、ID、分类、slug..." /></label>
+          <span style={{ color: 'var(--muted)' }}>
+            {groupByEvent
+              ? `${groups.length} 个 event · ${rows.length} 个市场`
+              : `${rows.length} / ${data?.predictOnlyCount ?? 0}`}
+          </span>
         </div>
 
+        {groupByEvent ? (
+          <div className="tableWrap">
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ cursor: 'pointer' }} onClick={() => toggleSort('title')}>Event {sortKey === 'title' ? (sortDesc ? '↓' : '↑') : ''}</th>
+                  <th style={{ cursor: 'pointer' }} onClick={() => toggleSort('hourlyRate')}>总 PP/h {sortKey === 'hourlyRate' ? (sortDesc ? '↓' : '↑') : ''}</th>
+                  <th>选项</th>
+                  <th style={{ cursor: 'pointer' }} onClick={() => toggleSort('endMs')}>End {sortKey === 'endMs' ? (sortDesc ? '↓' : '↑') : ''}</th>
+                  <th>链接</th>
+                </tr>
+              </thead>
+              <tbody>
+                {groups.map((g) => (
+                  <tr key={g.slug} className={g.totalHourlyRate > 0 ? 'hit' : ''}>
+                    <td>
+                      <b>{g.title}</b>
+                      <small>{g.slug}</small>
+                    </td>
+                    <td className={g.totalHourlyRate > 0 ? 'positive' : ''}>
+                      <b>{fmtNumber(g.totalHourlyRate, 1)}</b>
+                      <small>{g.markets.length} 个选项</small>
+                    </td>
+                    <td>
+                      <details>
+                        <summary style={{ cursor: 'pointer', color: 'var(--muted)' }}>展开 {g.markets.length} 个</summary>
+                        <ul style={{ margin: '8px 0 0', paddingLeft: 16 }}>
+                          {g.markets.map((m) => (
+                            <li key={m.id} style={{ marginBottom: 4 }}>
+                              <code>{m.id}</code> {m.title}
+                              {m.hourlyRate > 0 && <span className="positive"> · PP/h {fmtNumber(m.hourlyRate, 1)}</span>}
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    </td>
+                    <td>
+                      {g.endMs ? new Date(g.endMs).toLocaleDateString('zh-CN') : '-'}
+                      {g.endMs && <small>{fmtRemaining(g.endMs)}</small>}
+                    </td>
+                    <td>
+                      <a className="linkOut" href={g.url} target="_blank" rel="noreferrer">打开 ↗</a>
+                    </td>
+                  </tr>
+                ))}
+                {!groups.length && (
+                  <tr>
+                    <td colSpan={5} className="empty">{loading ? '加载中...' : '暂无数据'}</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        ) : (
         <div className="tableWrap">
           <table>
             <thead>
@@ -317,6 +428,7 @@ export default function PredictOnlyPage() {
             </tbody>
           </table>
         </div>
+        )}
       </section>
     </main>
   );

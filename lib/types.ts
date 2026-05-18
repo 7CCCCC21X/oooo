@@ -60,6 +60,7 @@ export type PredictMarketSummary = {
   question?: string;
   slug?: string;
   categorySlug?: string;
+  categoryTitle?: string;
   status?: string;
   tradingStatus?: string;
   isResolved?: boolean;

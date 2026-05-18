@@ -1,5 +1,6 @@
 import {
   filterPredictOnly,
+  groupMarketsByCategory,
   predictMarketUrl
 } from './predict-markets';
 import { getCacheStatus, getMarketsCachedOrFetch, refreshMarketsCache } from './predict-cache';
@@ -174,50 +175,58 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
     void durationMs;
     void fetchedAt;
     const totalFound = predictOnly.length;
-    const totalPP = predictOnly.reduce((s, m) => s + (m.hourlyRate || 0), 0);
-    const header = `📊 Predict 独有市场${onlyRewards ? '（仅在派 PP）' : ''} · 共 ${totalFound} 个（未结束）\n总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）\n`;
+    // 按 event (categorySlug) 分组，同一个 event 的子市场合并显示
+    const groups = groupMarketsByCategory(predictOnly);
+    groups.sort((a, b) => (b.totalHourlyRate || 0) - (a.totalHourlyRate || 0));
+    const totalPP = groups.reduce((s, g) => s + g.totalHourlyRate, 0);
+    const header = `📊 Predict 独有市场${onlyRewards ? '（仅在派 PP）' : ''}\n共 ${groups.length} 个 event / ${totalFound} 个市场（未结束）\n总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）\n`;
 
-    if (totalFound <= 30) {
-      // 少量直接发消息
-      const items = predictOnly.map((m, i) => {
-        const remain = fmtRemaining(m.endMs);
-        return `${i + 1}. ${m.title || '(无标题)'}\n   PP/h: ${fmt(m.hourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}${m.category ? ` · ${m.category}` : ''}\n   ${predictMarketUrl(m)}`;
-      });
-      await sendInChunks(chatId, header, items);
-    } else {
-      // 量多时：消息只发前 20 条 + 完整列表做附件
-      const top = predictOnly.slice(0, 20).map((m, i) => {
-        const remain = fmtRemaining(m.endMs);
-        return `${i + 1}. ${m.title || '(无标题)'}\n   PP/h: ${fmt(m.hourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}\n   ${predictMarketUrl(m)}`;
-      });
-      const previewText = `${header}\n📌 PP/h Top 20（完整 ${totalFound} 个见附件）\n\n${top.join('\n\n')}`;
-      await tg('sendMessage', { chat_id: chatId, text: previewText.slice(0, 3900), disable_web_page_preview: true });
+    const MAX_OPTIONS_INLINE = 12; // 单个 event 内嵌选项上限
+    const items = groups.map((g, i) => {
+      const remain = fmtRemaining(g.endMs);
+      const lines = [`${i + 1}. ${g.title}`];
+      const ppLine = `   总 PP/h: ${fmt(g.totalHourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}`;
+      lines.push(ppLine);
+      if (g.markets.length > 1) {
+        const shown = g.markets.slice(0, MAX_OPTIONS_INLINE);
+        lines.push(`   选项 (${g.markets.length}):`);
+        for (const m of shown) {
+          const pp = m.hourlyRate > 0 ? ` · PP/h ${fmt(m.hourlyRate, 1)}` : '';
+          lines.push(`     • ${m.title || '?'}${pp}`);
+        }
+        if (g.markets.length > MAX_OPTIONS_INLINE) {
+          lines.push(`     ...还有 ${g.markets.length - MAX_OPTIONS_INLINE} 个`);
+        }
+      }
+      lines.push(`   ${g.url}`);
+      return lines.join('\n');
+    });
 
-      // 附件：完整列表
+    await sendInChunks(chatId, header, items);
+
+    // 如果 event 数量超大（>200），同时给一份完整 .txt 附件兜底
+    if (groups.length > 200) {
       const fileLines = [
-        `Predict 独有市场（未结束）`,
+        `Predict 独有市场（未结束）— 按 event 分组`,
         `生成时间: ${new Date().toLocaleString('zh-CN', { hour12: false })}`,
-        `共 ${totalFound} 个 · 总 PP/h = ${fmt(totalPP, 1)}`,
-        `（cached at ${fetchedAt}）`,
+        `共 ${groups.length} 个 event / ${totalFound} 个市场 · 总 PP/h = ${fmt(totalPP, 1)}`,
         `${'='.repeat(60)}`,
         ''
       ];
-      for (let i = 0; i < predictOnly.length; i++) {
-        const m = predictOnly[i];
-        const remain = fmtRemaining(m.endMs);
-        const lines = [
-          `${i + 1}. ${m.title || '(无标题)'}`,
-          `   ID: ${m.id}  PP/h: ${fmt(m.hourlyRate, 1)}${remain ? '  剩余: ' + remain : ''}`,
-          `   分类: ${m.category || '-'}${m.categorySlug ? '  slug: ' + m.categorySlug : ''}`,
-          `   URL: ${predictMarketUrl(m)}`,
-          ''
-        ];
-        fileLines.push(lines.join('\n'));
+      for (let i = 0; i < groups.length; i++) {
+        const g = groups[i];
+        const remain = fmtRemaining(g.endMs);
+        fileLines.push(`${i + 1}. ${g.title}`);
+        fileLines.push(`   总 PP/h: ${fmt(g.totalHourlyRate, 1)}${remain ? '  剩余: ' + remain : ''}  (${g.markets.length} 个选项)`);
+        fileLines.push(`   URL: ${g.url}`);
+        for (const m of g.markets) {
+          fileLines.push(`     - [${m.id}] ${m.title || '?'}${m.hourlyRate > 0 ? '  PP/h ' + fmt(m.hourlyRate, 1) : ''}`);
+        }
+        fileLines.push('');
       }
-      const content = fileLines.join('\n');
       const date = new Date().toISOString().slice(0, 10);
-      const filename = `predict-only-${onlyRewards ? 'rewards-' : ''}${date}.txt`;
-      await tgSendDocument(chatId, filename, content, `📎 ${totalFound} 个未结束的 predict 独有市场`);
+      const filename = `predict-only-grouped-${date}.txt`;
+      await tgSendDocument(chatId, filename, fileLines.join('\n'), `📎 完整 ${groups.length} 个 event`);
     }
   } catch (err) {
     await tg('sendMessage', {
