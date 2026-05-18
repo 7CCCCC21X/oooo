@@ -106,18 +106,22 @@ async function sendInChunks(chatId: number | string, header: string, items: stri
     return;
   }
   const MAX = 3800;
+  const messages: string[] = [];
   let buf = header;
   for (const item of items) {
     const sep = buf ? '\n\n' : '';
     if (buf.length + sep.length + item.length > MAX) {
-      await tg('sendMessage', { chat_id: chatId, text: buf, disable_web_page_preview: true });
+      messages.push(buf);
       buf = item;
     } else {
       buf += sep + item;
     }
   }
-  if (buf) {
-    await tg('sendMessage', { chat_id: chatId, text: buf, disable_web_page_preview: true });
+  if (buf) messages.push(buf);
+  // throttle 避免 TG 429（每秒最多 1 条消息到同一 chat）
+  for (let i = 0; i < messages.length; i++) {
+    if (i > 0) await new Promise((r) => setTimeout(r, 1200));
+    await tg('sendMessage', { chat_id: chatId, text: messages[i], disable_web_page_preview: true });
   }
 }
 
@@ -135,6 +139,10 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
     const entry = await getMarketsCachedOrFetch();
     const { markets, pagesFetched, stoppedReason, totalCategories, totalUniqueMarketIds, fetchedAt, durationMs } = entry;
     let predictOnly = filterPredictOnly(markets);
+    const beforeTradeable = predictOnly.length;
+    // 默认只显示未结束的市场（用户要的是「现在能玩的 predict 独有」）
+    predictOnly = predictOnly.filter((m) => m.tradeable);
+    const afterTradeable = predictOnly.length;
     if (onlyRewards) {
       predictOnly = predictOnly.filter((m) => m.hourlyRate > 0);
     }
@@ -147,9 +155,20 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
       });
       return;
     }
+    // TG 长消息 + rate limit，最多发 100 条避免 429
+    const MAX_DISPLAY = 100;
+    const totalFound = predictOnly.length;
+    let truncated = false;
+    if (predictOnly.length > MAX_DISPLAY) {
+      predictOnly = predictOnly.slice(0, MAX_DISPLAY);
+      truncated = true;
+    }
     void durationMs;
+    void beforeTradeable;
+    void afterTradeable;
     const totalPP = predictOnly.reduce((s, m) => s + (m.hourlyRate || 0), 0);
-    const header = `📊 Predict 独有市场${onlyRewards ? '（仅在派 PP）' : ''} · 共 ${predictOnly.length} 个\n总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）\n`;
+    const truncatedLine = truncated ? `\n⚠️ 仅显示前 ${MAX_DISPLAY}/${totalFound}（按 PP/h 降序）。完整列表用网页 /predict-only 查看。` : '';
+    const header = `📊 Predict 独有市场${onlyRewards ? '（仅在派 PP）' : ''} · 显示 ${predictOnly.length}/${totalFound} 个（未结束）\n总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）${truncatedLine}\n`;
     const items = predictOnly.map((m, i) => {
       const remain = fmtRemaining(m.endMs);
       return `${i + 1}. ${m.title || '(无标题)'}\n   PP/h: ${fmt(m.hourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}${m.category ? ` · ${m.category}` : ''}\n   ${predictMarketUrl(m)}`;
