@@ -99,6 +99,7 @@ export default function PredictOnlyPage() {
   const [error, setError] = useState('');
   const [includeClosed, setIncludeClosed] = useState(false);
   const [hasActiveRewards, setHasActiveRewards] = useState(true);
+  const [onlyWithPP, setOnlyWithPP] = useState(true);
   const [minHourlyRate, setMinHourlyRate] = useState(0);
   const [search, setSearch] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('hourlyRate');
@@ -134,18 +135,19 @@ export default function PredictOnlyPage() {
 
   const rows = useMemo(() => {
     const list = data?.predictOnly || [];
-    // 客户端再过滤一遍 tradeable（API 缓存里啥都有）
-    const tradeableFiltered = includeClosed ? list : list.filter((m) => m.tradeable);
+    // 客户端再过滤一遍 tradeable + PP/h（API 缓存里啥都有）
+    let filteredList = includeClosed ? list : list.filter((m) => m.tradeable);
+    if (onlyWithPP) filteredList = filteredList.filter((m) => m.hourlyRate > 0);
     const keyword = search.trim().toLowerCase();
     const filtered = keyword
-      ? tradeableFiltered.filter(
+      ? filteredList.filter(
           (m) =>
             m.title.toLowerCase().includes(keyword) ||
             m.id.includes(keyword) ||
             (m.category || '').toLowerCase().includes(keyword) ||
             (m.categorySlug || '').toLowerCase().includes(keyword)
         )
-      : tradeableFiltered;
+      : filteredList;
     const sorted = [...filtered].sort((a, b) => {
       if (sortKey === 'title') {
         const av = a.title.toLowerCase();
@@ -164,7 +166,7 @@ export default function PredictOnlyPage() {
       return sortDesc ? bv - av : av - bv;
     });
     return sorted;
-  }, [data, search, sortKey, sortDesc, includeClosed]);
+  }, [data, search, sortKey, sortDesc, includeClosed, onlyWithPP]);
 
   const openCount = useMemo(() => (data?.predictOnly || []).filter((m) => m.tradeable).length, [data]);
   const closedCount = useMemo(() => (data?.predictOnly || []).filter((m) => !m.tradeable).length, [data]);
@@ -185,7 +187,7 @@ export default function PredictOnlyPage() {
       list.push(m);
       map.set(key, list);
     }
-    const result: EventGroup[] = Array.from(map.entries()).map(([slug, list]) => {
+    let result: EventGroup[] = Array.from(map.entries()).map(([slug, list]) => {
       list.sort((a, b) => (b.hourlyRate || 0) - (a.hourlyRate || 0));
       const first = list[0];
       const title = first.categoryTitle || first.category || first.title || slug;
@@ -200,6 +202,8 @@ export default function PredictOnlyPage() {
         markets: list
       };
     });
+    // event 总 PP=0 的也丢掉（除非用户主动关掉 onlyWithPP）
+    if (onlyWithPP) result = result.filter((g) => g.totalHourlyRate > 0);
     result.sort((a, b) => {
       if (sortKey === 'hourlyRate') return sortDesc ? b.totalHourlyRate - a.totalHourlyRate : a.totalHourlyRate - b.totalHourlyRate;
       if (sortKey === 'endMs') {
@@ -211,7 +215,7 @@ export default function PredictOnlyPage() {
       return 0;
     });
     return result;
-  }, [rows, groupByEvent, sortKey, sortDesc]);
+  }, [rows, groupByEvent, sortKey, sortDesc, onlyWithPP]);
 
   function toggleSort(key: SortKey) {
     if (sortKey === key) {
@@ -254,6 +258,10 @@ export default function PredictOnlyPage() {
         <label className="switch">
           <input type="checkbox" checked={hasActiveRewards} onChange={(e) => setHasActiveRewards(e.target.checked)} />
           仅有奖励的市场 (hasActiveRewards)
+        </label>
+        <label className="switch">
+          <input type="checkbox" checked={onlyWithPP} onChange={(e) => setOnlyWithPP(e.target.checked)} />
+          只看在派 PP
         </label>
         <label className="switch">
           <input type="checkbox" checked={includeClosed} onChange={(e) => setIncludeClosed(e.target.checked)} />

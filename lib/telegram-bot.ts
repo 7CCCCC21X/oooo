@@ -101,8 +101,7 @@ function fmtRemaining(endMs?: number | null): string {
 
 const MENU_KEYBOARD = {
   inline_keyboard: [
-    [{ text: '📊 Predict 独有市场（全部）', callback_data: 'predict_only_all' }],
-    [{ text: '💰 仅显示在派 PP 的', callback_data: 'predict_only_rewards' }],
+    [{ text: '📊 Predict 独有市场（在派 PP）', callback_data: 'predict_only_all' }],
     [{ text: '🔄 强制刷新缓存', callback_data: 'refresh_cache' }],
     [{ text: '🚨 立即跑一次价差检查', callback_data: 'check_spreads' }],
     [{ text: 'ℹ️ 监控状态', callback_data: 'status' }, { text: '❓ 帮助', callback_data: 'help' }]
@@ -144,7 +143,7 @@ async function sendInChunks(chatId: number | string, header: string, items: stri
   }
 }
 
-async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
+async function handlePredictOnly(chatId: number | string, onlyRewards = true) {
   const status = getCacheStatus();
   if (!status.hasCache) {
     await tg('sendMessage', {
@@ -158,7 +157,7 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
     const entry = await getMarketsCachedOrFetch();
     const { markets, pagesFetched, stoppedReason, totalCategories, totalUniqueMarketIds, fetchedAt, durationMs } = entry;
     let predictOnly = filterPredictOnly(markets);
-    // 默认只显示未结束的市场
+    // 默认只显示「未结束 + 在派 PP」的市场
     predictOnly = predictOnly.filter((m) => m.tradeable);
     if (onlyRewards) {
       predictOnly = predictOnly.filter((m) => m.hourlyRate > 0);
@@ -168,18 +167,24 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = false) {
       const withPoly = markets.length - filterPredictOnly(markets).length;
       await tg('sendMessage', {
         chat_id: chatId,
-        text: `没找到 predict 独有市场。\nsource: /v1/categories (cached at ${fetchedAt})\n抓取: ${pagesFetched} 页 (stop=${stoppedReason})\n类目数: ${totalCategories}\n市场数: ${totalUniqueMarketIds}\n通过 tradeable 过滤: ${markets.length}\n其中 polymarket 映射: ${withPoly}`
+        text: `没找到 predict 独有市场（在派 PP）。\nsource: /v1/categories (cached at ${fetchedAt})\n抓取: ${pagesFetched} 页 (stop=${stoppedReason})\n类目数: ${totalCategories}\n市场数: ${totalUniqueMarketIds}\n通过 tradeable+PP 过滤: ${predictOnly.length}\n其中 polymarket 映射: ${withPoly}`
       });
       return;
     }
     void durationMs;
     void fetchedAt;
     const totalFound = predictOnly.length;
-    // 按 event (categorySlug) 分组，同一个 event 的子市场合并显示
-    const groups = groupMarketsByCategory(predictOnly);
+    // 按 event (categorySlug) 分组
+    let groups = groupMarketsByCategory(predictOnly);
+    // event 总 PP/h = 0 的也丢掉
+    groups = groups.filter((g) => g.totalHourlyRate > 0);
     groups.sort((a, b) => (b.totalHourlyRate || 0) - (a.totalHourlyRate || 0));
+    if (!groups.length) {
+      await tg('sendMessage', { chat_id: chatId, text: `没找到正在派 PP 的 predict 独有 event。` });
+      return;
+    }
     const totalPP = groups.reduce((s, g) => s + g.totalHourlyRate, 0);
-    const header = `📊 Predict 独有市场${onlyRewards ? '（仅在派 PP）' : ''}\n共 ${groups.length} 个 event / ${totalFound} 个市场（未结束）\n总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）\n`;
+    const header = `📊 Predict 独有市场（在派 PP）\n共 ${groups.length} 个 event / ${totalFound} 个市场\n总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）\n`;
 
     const MAX_OPTIONS_INLINE = 12; // 单个 event 内嵌选项上限
     const items = groups.map((g, i) => {
@@ -297,8 +302,8 @@ async function handleHelp(chatId: number | string) {
     '🤖 命令列表',
     '',
     '/menu - 显示主菜单（按钮）',
-    '/predict_only - Predict 独有市场全部（按 PP/h 降序）',
-    '/predict_only rewards - 仅显示在派 PP 的独有市场',
+    '/predict_only - Predict 独有市场（默认只看在派 PP 的，按 event 分组）',
+    '/predict_only all - 包含 PP=0 的市场',
     '/check - 立即跑一次价差检查',
     '/status - 监控运行状态',
     '/help - 显示这条帮助',
@@ -317,8 +322,9 @@ async function handleCommand(chatId: number | string, command: string, args: str
       return;
     case '/predict_only':
     case '/predictonly': {
-      const onlyRewards = args.some((a) => a.toLowerCase() === 'rewards' || a.toLowerCase() === 'pp');
-      await handlePredictOnly(chatId, onlyRewards);
+      // 默认只看在派 PP 的；传 all 才包含 PP=0 的
+      const includeZeroPP = args.some((a) => a.toLowerCase() === 'all' || a.toLowerCase() === '全部');
+      await handlePredictOnly(chatId, !includeZeroPP);
       return;
     }
     case '/check':
@@ -351,8 +357,6 @@ async function handleCallback(query: TgCallbackQuery) {
   switch (data) {
     case 'predict_only':
     case 'predict_only_all':
-      await handlePredictOnly(chatId, false);
-      break;
     case 'predict_only_rewards':
       await handlePredictOnly(chatId, true);
       break;
