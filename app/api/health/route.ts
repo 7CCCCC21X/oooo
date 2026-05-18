@@ -8,6 +8,9 @@ export async function GET() {
     ok: true,
     now: new Date().toISOString(),
     monitorRunning: !!globalThis.__spreadMonitorTimer,
+    botPolling: !!globalThis.__tgBotPolling,
+    botLastEventAt: globalThis.__tgBotLastCycleAt || null,
+    botLastError: globalThis.__tgBotLastError || null,
     hasTelegram: !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID)
   });
 }

@@ -3,4 +3,6 @@ export async function register() {
   if (process.env.NODE_ENV !== 'production') return;
   const { startBackgroundMonitor } = await import('./lib/monitor');
   startBackgroundMonitor();
+  const { startBotLongPolling } = await import('./lib/telegram-bot');
+  startBotLongPolling();
 }
