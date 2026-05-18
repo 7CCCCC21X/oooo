@@ -1,4 +1,4 @@
-import { fetchJson } from './fetch-json';
+import { fetchJson, fetchJsonWithHeaders } from './fetch-json';
 import type { PredictMarketSummary } from './types';
 
 const PREDICT_REST_BASE = 'https://api.predict.fun/v1';
@@ -406,11 +406,36 @@ export type PredictCategoryRaw = {
   [key: string]: any;
 };
 
+function pickCursorFromHeaders(headers: Record<string, string>): string {
+  // 常见的 cursor header
+  return String(
+    headers['x-next-cursor'] ||
+      headers['x-cursor'] ||
+      headers['next-cursor'] ||
+      headers['x-pagination-cursor'] ||
+      ''
+  );
+}
+
+function parseLinkHeader(link: string | undefined): string {
+  if (!link) return '';
+  // Link: <url>; rel="next", <url>; rel="prev"
+  const m = link.match(/<([^>]+)>\s*;\s*rel="next"/i);
+  if (!m) return '';
+  try {
+    const u = new URL(m[1]);
+    return u.searchParams.get('after') || u.searchParams.get('cursor') || '';
+  } catch {
+    return '';
+  }
+}
+
 export async function fetchAllPredictCategories(options: { limit?: number; maxPages?: number } = {}): Promise<{
   categories: PredictCategoryRaw[];
   pagesFetched: number;
   stoppedReason: string;
   totalUniqueIds: number;
+  firstPageDebug?: { responseKeys: string[] | null; headerKeys: string[]; sampleHeaderValues: Record<string, string> };
 }> {
   const apiKey = process.env.PREDICT_API_KEY;
   const headers: Record<string, string> = { Accept: 'application/json' };
@@ -426,6 +451,7 @@ export async function fetchAllPredictCategories(options: { limit?: number; maxPa
   let pagesFetched = 0;
   let stoppedReason = 'exhausted';
   let emptyPagesInARow = 0;
+  let firstPageDebug: { responseKeys: string[] | null; headerKeys: string[]; sampleHeaderValues: Record<string, string> } | undefined;
 
   while (pagesFetched < maxPages) {
     const params = new URLSearchParams();
@@ -433,8 +459,41 @@ export async function fetchAllPredictCategories(options: { limit?: number; maxPa
     if (cursor) params.set('after', cursor);
 
     const url = `${PREDICT_REST_BASE}/categories?${params.toString()}`;
-    const raw = await fetchJson(url, { headers });
+    let raw: unknown;
+    let respHeaders: Record<string, string> = {};
+    try {
+      const r = await fetchJsonWithHeaders(url, { headers });
+      raw = r.json;
+      respHeaders = r.headers;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('invalid_cursor') || msg.includes('400')) {
+        stoppedReason = `cursor-rejected-page-${pagesFetched + 1}: ${msg.slice(0, 150)}`;
+        console.warn(`[predict] cursor rejected after page ${pagesFetched}, keeping partial data:`, msg.slice(0, 200));
+        break;
+      }
+      // 其它错（429/5xx 等）：保留已抓到的，停
+      stoppedReason = `fetch-error-page-${pagesFetched + 1}: ${msg.slice(0, 150)}`;
+      console.warn(`[predict] fetch error after page ${pagesFetched}, keeping partial:`, msg.slice(0, 200));
+      break;
+    }
     pagesFetched += 1;
+
+    if (pagesFetched === 1) {
+      const isArr = Array.isArray(raw);
+      const cursorRelatedHeaders: Record<string, string> = {};
+      for (const k of Object.keys(respHeaders)) {
+        if (k.toLowerCase().includes('cursor') || k.toLowerCase() === 'link' || k.toLowerCase().includes('next') || k.toLowerCase().includes('page')) {
+          cursorRelatedHeaders[k] = respHeaders[k];
+        }
+      }
+      firstPageDebug = {
+        responseKeys: isArr ? null : raw && typeof raw === 'object' ? Object.keys(raw as object) : null,
+        headerKeys: Object.keys(respHeaders),
+        sampleHeaderValues: cursorRelatedHeaders
+      };
+      console.log(`[predict] /v1/categories page 1: isArray=${isArr}, headers=${Object.keys(cursorRelatedHeaders).join(',') || '(none related)'}`);
+    }
 
     const rows = pickArray(raw);
     if (!rows.length) {
@@ -449,18 +508,24 @@ export async function fetchAllPredictCategories(options: { limit?: number; maxPa
 
     const sizeBefore = seen.size;
     let lastRowId: string | null = null;
+    let lastRowSlug: string | null = null;
     for (const row of rows) {
       const r = row as PredictCategoryRaw;
       const id = String(r?.id ?? '').trim();
       if (!id) continue;
       lastRowId = id;
+      if (r?.slug) lastRowSlug = String(r.slug);
       if (seen.has(id)) continue;
       seen.add(id);
       all.push(r);
     }
     const newUniqueThisPage = seen.size - sizeBefore;
 
-    const nextCursor = pickCursorFromResponse(raw) || lastRowId || '';
+    // 多个 cursor 候选，优先级 headers > response body > lastSlug > lastId
+    const headerCursor = pickCursorFromHeaders(respHeaders) || parseLinkHeader(respHeaders['link']);
+    const bodyCursor = pickCursorFromResponse(raw);
+    const nextCursor = headerCursor || bodyCursor || lastRowSlug || lastRowId || '';
+
     if (!nextCursor) {
       stoppedReason = 'no-cursor-found';
       break;
@@ -485,7 +550,8 @@ export async function fetchAllPredictCategories(options: { limit?: number; maxPa
     categories: all,
     pagesFetched,
     stoppedReason,
-    totalUniqueIds: seen.size
+    totalUniqueIds: seen.size,
+    firstPageDebug
   };
 }
 

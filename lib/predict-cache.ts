@@ -63,8 +63,18 @@ export async function refreshMarketsCache(maxPages = MAX_PAGES): Promise<Markets
       fetchedAt: new Date().toISOString(),
       durationMs: Date.now() - start
     };
+    // 即便分页中途出错（stoppedReason 带 cursor-rejected / fetch-error），
+    // 只要拿到了任何数据就存为缓存。否则才视为彻底失败。
+    if (entry.markets.length === 0) {
+      throw new Error(`got 0 markets (stop=${entry.stoppedReason})`);
+    }
     globalThis.__predictMarketsCache = entry;
-    globalThis.__predictCacheLastError = undefined;
+    // 部分数据也算成功，但把 stoppedReason 里的错暴露出来
+    if (entry.stoppedReason.startsWith('cursor-rejected') || entry.stoppedReason.startsWith('fetch-error')) {
+      globalThis.__predictCacheLastError = `部分数据（${entry.markets.length} markets）。${entry.stoppedReason}`;
+    } else {
+      globalThis.__predictCacheLastError = undefined;
+    }
     console.log(`[predict-cache] refresh done: ${entry.markets.length} markets, ${entry.pagesFetched} pages, ${entry.durationMs}ms, stop=${entry.stoppedReason}`);
     return entry;
   })()
