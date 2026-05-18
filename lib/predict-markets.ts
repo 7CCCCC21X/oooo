@@ -389,3 +389,170 @@ export async function fetchAllPredictMarkets(options: FetchOptions = {}): Promis
 export function filterPredictOnly(markets: PredictMarketSummary[]): PredictMarketSummary[] {
   return markets.filter((m) => !m.hasPolymarket);
 }
+
+// ============================================================
+// /v1/categories 遍历方案
+// predict.fun 真正的数据结构入口：所有市场都挂在 category 下
+// （esports / competition / event 等都只在 category 里出现）
+// ============================================================
+
+export type PredictCategoryRaw = {
+  id: string | number;
+  slug?: string;
+  title?: string;
+  status?: string;
+  marketsCount?: number;
+  markets?: any[];
+  [key: string]: any;
+};
+
+export async function fetchAllPredictCategories(options: { limit?: number; maxPages?: number } = {}): Promise<{
+  categories: PredictCategoryRaw[];
+  pagesFetched: number;
+  stoppedReason: string;
+  totalUniqueIds: number;
+}> {
+  const apiKey = process.env.PREDICT_API_KEY;
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  if (apiKey) headers['x-api-key'] = apiKey;
+
+  const limit = options.limit ?? 100;
+  const maxPages = options.maxPages ?? 100;
+
+  const all: PredictCategoryRaw[] = [];
+  const seen = new Set<string>();
+  let cursor: string | null = null;
+  let lastCursor: string | null = null;
+  let pagesFetched = 0;
+  let stoppedReason = 'exhausted';
+  let emptyPagesInARow = 0;
+
+  while (pagesFetched < maxPages) {
+    const params = new URLSearchParams();
+    params.set('first', String(limit));
+    if (cursor) params.set('after', cursor);
+
+    const url = `${PREDICT_REST_BASE}/categories?${params.toString()}`;
+    const raw = await fetchJson(url, { headers });
+    pagesFetched += 1;
+
+    const rows = pickArray(raw);
+    if (!rows.length) {
+      emptyPagesInARow += 1;
+      if (emptyPagesInARow >= 2) {
+        stoppedReason = 'empty-page';
+        break;
+      }
+      continue;
+    }
+    emptyPagesInARow = 0;
+
+    const sizeBefore = seen.size;
+    let lastRowId: string | null = null;
+    for (const row of rows) {
+      const r = row as PredictCategoryRaw;
+      const id = String(r?.id ?? '').trim();
+      if (!id) continue;
+      lastRowId = id;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      all.push(r);
+    }
+    const newUniqueThisPage = seen.size - sizeBefore;
+
+    const nextCursor = pickCursorFromResponse(raw) || lastRowId || '';
+    if (!nextCursor) {
+      stoppedReason = 'no-cursor-found';
+      break;
+    }
+    if (nextCursor === lastCursor) {
+      stoppedReason = 'cursor-not-advancing';
+      break;
+    }
+    if (pagesFetched > 1 && newUniqueThisPage === 0) {
+      stoppedReason = 'no-new-ids';
+      break;
+    }
+    lastCursor = nextCursor;
+    cursor = nextCursor;
+  }
+
+  if (pagesFetched >= maxPages && stoppedReason === 'exhausted') {
+    stoppedReason = `hit-max-pages-${maxPages}`;
+  }
+
+  return {
+    categories: all,
+    pagesFetched,
+    stoppedReason,
+    totalUniqueIds: seen.size
+  };
+}
+
+// 把 categories 里嵌入的 markets 拉平，去重，normalize
+export function flattenCategoryMarkets(
+  categories: PredictCategoryRaw[],
+  options: { includeClosed?: boolean } = {}
+): { markets: PredictMarketSummary[]; categoriesWithoutMarkets: number; totalMarketIds: number } {
+  const includeClosed = options.includeClosed ?? true;
+  const out: PredictMarketSummary[] = [];
+  const seenMarketIds = new Set<string>();
+  let categoriesWithoutMarkets = 0;
+
+  for (const cat of categories) {
+    const markets = Array.isArray(cat.markets) ? cat.markets : [];
+    if (!markets.length) {
+      categoriesWithoutMarkets += 1;
+      continue;
+    }
+    for (const m of markets) {
+      const id = String(m?.id ?? '').trim();
+      if (!id || seenMarketIds.has(id)) continue;
+      seenMarketIds.add(id);
+      // 补 category 信息到 market 对象再 normalize
+      const enriched = {
+        ...m,
+        categorySlug: m.categorySlug ?? cat.slug,
+        categoryTitle: cat.title,
+        categoryStatus: cat.status
+      };
+      const summary = normalizeMarket(enriched);
+      if (!includeClosed && !summary.tradeable) continue;
+      out.push(summary);
+    }
+  }
+  return { markets: out, categoriesWithoutMarkets, totalMarketIds: seenMarketIds.size };
+}
+
+// 综合版：先扫所有 categories，提取嵌入的 markets。
+// 这是 bot / 列表页应该用的入口，覆盖最全（包括 esports / event 类）。
+export async function fetchAllPredictMarketsViaCategories(options: {
+  limit?: number;
+  maxPages?: number;
+  includeClosed?: boolean;
+} = {}): Promise<{
+  markets: PredictMarketSummary[];
+  pagesFetched: number;
+  stoppedReason: string;
+  totalCategories: number;
+  totalUniqueMarketIds: number;
+  categoriesWithoutMarkets: number;
+  source: 'categories';
+}> {
+  const { categories, pagesFetched, stoppedReason, totalUniqueIds } = await fetchAllPredictCategories({
+    limit: options.limit,
+    maxPages: options.maxPages
+  });
+  const { markets, categoriesWithoutMarkets, totalMarketIds } = flattenCategoryMarkets(categories, {
+    includeClosed: options.includeClosed ?? true
+  });
+  return {
+    markets,
+    pagesFetched,
+    stoppedReason,
+    totalCategories: totalUniqueIds,
+    totalUniqueMarketIds: totalMarketIds,
+    categoriesWithoutMarkets,
+    source: 'categories'
+  };
+}

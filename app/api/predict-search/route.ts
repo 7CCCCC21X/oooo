@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { fetchAllPredictMarkets } from '@/lib/predict-markets';
+import { fetchAllPredictMarketsViaCategories } from '@/lib/predict-markets';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -10,28 +10,35 @@ export async function GET(request: Request) {
   const slug = (url.searchParams.get('slug') || '').trim().toLowerCase();
   const includeClosed = url.searchParams.get('includeClosed') !== '0';
   try {
-    const { markets, pagesFetched, stoppedReason, paginationMode, rawWrapperKeys, sampleRaw } = await fetchAllPredictMarkets({
-      includeClosed,
-      hasActiveRewards: false,
-      limit: 100,
-      maxPages: 100
-    });
+    const { markets, pagesFetched, stoppedReason, totalCategories, totalUniqueMarketIds, categoriesWithoutMarkets, source } =
+      await fetchAllPredictMarketsViaCategories({
+        includeClosed,
+        limit: 100,
+        maxPages: 200
+      });
     const matches = markets.filter((m) => {
-      const blob = [m.id, m.title, m.question, m.slug, m.categorySlug, m.category].filter(Boolean).join(' ').toLowerCase();
-      if (slug && (m.slug?.toLowerCase() === slug || m.categorySlug?.toLowerCase() === slug)) return true;
-      if (q && blob.includes(q)) return true;
+      if (slug) {
+        if (m.slug?.toLowerCase() === slug) return true;
+        if (m.categorySlug?.toLowerCase() === slug) return true;
+        return false;
+      }
+      if (q) {
+        const blob = [m.id, m.title, m.question, m.slug, m.categorySlug, m.category].filter(Boolean).join(' ').toLowerCase();
+        return blob.includes(q);
+      }
       return false;
     });
     return NextResponse.json({
       ok: true,
       query: { q, slug, includeClosed },
-      paginationMode,
+      source,
       pagesFetched,
       stoppedReason,
+      totalCategories,
+      totalUniqueMarketIds,
       totalMarkets: markets.length,
+      categoriesWithoutMarkets,
       matchCount: matches.length,
-      rawWrapperKeys,
-      sampleRawKeys: sampleRaw && typeof sampleRaw === 'object' ? Object.keys(sampleRaw as object) : null,
       matches
     });
   } catch (error) {
