@@ -265,6 +265,7 @@ export async function fetchAllPredictMarkets(options: FetchOptions = {}): Promis
   sampleRaw?: unknown;
   rawWrapperKeys?: string[];
   paginationMode?: string;
+  totalUniqueIds?: number;
 }> {
   const apiKey = process.env.PREDICT_API_KEY;
   const headers: Record<string, string> = { Accept: 'application/json' };
@@ -275,18 +276,17 @@ export async function fetchAllPredictMarkets(options: FetchOptions = {}): Promis
   const includeClosed = options.includeClosed ?? false;
   const hasActiveRewards = options.hasActiveRewards ?? false;
 
-  // hasActiveRewards=true 时 REST 的 ?after=<id> 游标分页有效；
-  // 全量时只能用 offset，因为 ?after=<id> 会返回同一页。
   const paginationMode: 'cursor' | 'offset' = hasActiveRewards ? 'cursor' : 'offset';
 
   const all: PredictMarketSummary[] = [];
-  const seen = new Set<string>();
+  const seenIds = new Set<string>();
   let lastId: string | null = null;
   let offset = 0;
   let pagesFetched = 0;
   let stoppedReason = 'exhausted';
   let sampleRaw: unknown = undefined;
   let rawWrapperKeys: string[] | undefined = undefined;
+  let emptyPagesInARow = 0;
 
   while (pagesFetched < maxPages) {
     const params = new URLSearchParams();
@@ -295,7 +295,11 @@ export async function fetchAllPredictMarkets(options: FetchOptions = {}): Promis
       if (lastId != null) params.set('after', String(lastId));
       params.set('hasActiveRewards', 'true');
     } else {
+      // 同时塞多种页大小参数名，谁能用 API 用谁
       params.set('limit', String(limit));
+      params.set('first', String(limit));
+      params.set('pageSize', String(limit));
+      params.set('per_page', String(limit));
       params.set('offset', String(offset));
     }
 
@@ -309,24 +313,31 @@ export async function fetchAllPredictMarkets(options: FetchOptions = {}): Promis
     const rows = pickArray(raw);
     if (!sampleRaw && rows.length) sampleRaw = rows[0];
     if (!rows.length) {
-      stoppedReason = 'empty-page';
-      break;
+      emptyPagesInARow += 1;
+      if (emptyPagesInARow >= 2) {
+        stoppedReason = 'empty-page';
+        break;
+      }
+      // 一次空页可能是 transient，再试一页
+      if (paginationMode === 'offset') offset += limit;
+      continue;
     }
+    emptyPagesInARow = 0;
 
-    let added = 0;
+    const sizeBefore = seenIds.size;
     let newLast: string | null = null;
     for (const row of rows) {
       const r = row as any;
       const id = String(r?.id ?? r?.marketId ?? r?.market_id ?? '').trim();
       if (!id) continue;
       newLast = id;
-      if (seen.has(id)) continue;
+      if (seenIds.has(id)) continue;
+      seenIds.add(id);
       const summary = normalizeMarket(r);
       if (!includeClosed && !summary.tradeable) continue;
-      seen.add(id);
       all.push(summary);
-      added += 1;
     }
+    const newUniqueThisPage = seenIds.size - sizeBefore;
 
     if (paginationMode === 'cursor') {
       if (!newLast || newLast === lastId) {
@@ -335,20 +346,29 @@ export async function fetchAllPredictMarkets(options: FetchOptions = {}): Promis
       }
       lastId = newLast;
     } else {
+      // offset mode：API 可能忽略 limit 返回少于 limit 行——不能因此早退
+      // 唯一可靠的退出信号是「这一页 0 个新 id」=> offset 也不生效
+      if (pagesFetched > 1 && newUniqueThisPage === 0) {
+        stoppedReason = 'offset-not-advancing';
+        break;
+      }
       offset += rows.length;
     }
-    if (rows.length < limit) {
-      stoppedReason = 'short-page';
-      break;
-    }
-    void added;
   }
 
   if (pagesFetched >= maxPages && stoppedReason === 'exhausted') {
     stoppedReason = `hit-max-pages-${maxPages}`;
   }
 
-  return { markets: all, pagesFetched, stoppedReason, sampleRaw, rawWrapperKeys, paginationMode };
+  return {
+    markets: all,
+    pagesFetched,
+    stoppedReason,
+    sampleRaw,
+    rawWrapperKeys,
+    paginationMode,
+    totalUniqueIds: seenIds.size
+  };
 }
 
 export function filterPredictOnly(markets: PredictMarketSummary[]): PredictMarketSummary[] {

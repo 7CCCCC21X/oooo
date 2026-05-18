@@ -93,6 +93,8 @@ export async function GET(request: Request) {
     return NextResponse.json({ ok: false, error: `Cannot extract slug from: ${input}` }, { status: 400 });
   }
   const deepScan = url.searchParams.get('deepScan') === '1';
+  const limit = Math.max(10, Math.min(200, Number(url.searchParams.get('limit') || '100')));
+  const maxPages = Math.max(1, Math.min(500, Number(url.searchParams.get('maxPages') || '100')));
 
   const apiKey = process.env.PREDICT_API_KEY;
   const headers: Record<string, string> = { Accept: 'application/json' };
@@ -132,16 +134,24 @@ export async function GET(request: Request) {
   }
 
   // 全部 REST endpoint 都没拿到 → 兜底：扫全量市场列表，本地按 slug 找
-  let deepScanInfo: { pagesFetched: number; totalScanned: number; matchedAt?: string } | undefined;
+  let deepScanInfo:
+    | { pagesFetched: number; totalScanned: number; totalUniqueIds?: number; stoppedReason?: string; paginationMode?: string; matchedId?: string }
+    | undefined;
   if (!found && deepScan) {
     try {
-      const { markets, pagesFetched } = await fetchAllPredictMarkets({
+      const { markets, pagesFetched, stoppedReason, totalUniqueIds, paginationMode } = await fetchAllPredictMarkets({
         includeClosed: true,
         hasActiveRewards: false,
-        limit: 100,
-        maxPages: 100
+        limit,
+        maxPages
       });
-      deepScanInfo = { pagesFetched, totalScanned: markets.length };
+      deepScanInfo = {
+        pagesFetched,
+        totalScanned: markets.length,
+        totalUniqueIds,
+        stoppedReason,
+        paginationMode
+      };
       const hit = markets.find(
         (m) =>
           lower(m.slug) === slug.toLowerCase() ||
@@ -151,7 +161,7 @@ export async function GET(request: Request) {
       if (hit) {
         found = hit;
         foundVia = 'deep-scan';
-        deepScanInfo.matchedAt = hit.id;
+        deepScanInfo.matchedId = hit.id;
       }
     } catch (err) {
       // ignore
