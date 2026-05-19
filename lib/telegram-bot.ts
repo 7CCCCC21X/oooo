@@ -4,6 +4,8 @@ import {
   predictMarketUrl
 } from './predict-markets';
 import { getCacheStatus, getMarketsCachedOrFetch, refreshMarketsCache } from './predict-cache';
+import { addSubscriber, getSubscribers, isSubscribed, removeSubscriber, getSubscribersFilePath } from './subscribers';
+import { getWatcherStatus, registerAlertSendFn } from './new-markets-alerts';
 import { runMonitorCycle } from './monitor';
 import { loadPairs } from './pairs';
 
@@ -44,6 +46,14 @@ async function tg(method: string, params: any, timeoutMs = 35_000): Promise<any>
   } finally {
     clearTimeout(timeout);
   }
+}
+
+export async function sendTextToChat(chatId: string, text: string): Promise<void> {
+  await tg('sendMessage', {
+    chat_id: chatId,
+    text: text.slice(0, 3900),
+    disable_web_page_preview: true
+  });
 }
 
 async function tgSendDocument(chatId: number | string, filename: string, content: string, caption?: string): Promise<void> {
@@ -102,6 +112,10 @@ function fmtRemaining(endMs?: number | null): string {
 const MENU_KEYBOARD = {
   inline_keyboard: [
     [{ text: '📊 Predict 独有市场（在派 PP）', callback_data: 'predict_only_all' }],
+    [
+      { text: '🔔 订阅新市场提醒', callback_data: 'subscribe' },
+      { text: '🔕 取消订阅', callback_data: 'unsubscribe' }
+    ],
     [{ text: '🔄 强制刷新缓存', callback_data: 'refresh_cache' }],
     [{ text: '🚨 立即跑一次价差检查', callback_data: 'check_spreads' }],
     [{ text: 'ℹ️ 监控状态', callback_data: 'status' }, { text: '❓ 帮助', callback_data: 'help' }]
@@ -111,6 +125,45 @@ const MENU_KEYBOARD = {
 async function handleRefreshCache(chatId: number | string) {
   await tg('sendMessage', { chat_id: chatId, text: '🔄 已触发后台刷新缓存，60~180 秒后再点查询即可。' });
   refreshMarketsCache().catch(() => {});
+}
+
+async function handleSubscribe(chatId: number | string, chatType: string) {
+  const added = addSubscriber(chatId);
+  await tg('sendMessage', {
+    chat_id: chatId,
+    text: added
+      ? `✅ 已订阅新市场提醒\n\nchat id: ${chatId}（${chatType}）\n\n当 predict.fun 出现新的「未结束 + 在派 PP」独有市场，会自动推送到这里。\n用 /unsubscribe 取消。`
+      : `这个 chat 已经订阅了。\nchat id: ${chatId}`
+  });
+}
+
+async function handleUnsubscribe(chatId: number | string) {
+  const removed = removeSubscriber(chatId);
+  await tg('sendMessage', {
+    chat_id: chatId,
+    text: removed
+      ? `🔕 已取消订阅。\nchat id: ${chatId}`
+      : `这个 chat 没在订阅列表里。\nchat id: ${chatId}`
+  });
+}
+
+async function handleSubscribers(chatId: number | string) {
+  const subs = getSubscribers();
+  const filePath = getSubscribersFilePath();
+  const lines = [
+    `📬 订阅者列表 (${subs.length})`,
+    ...subs.map((s, i) => `${i + 1}. ${s}${String(s) === String(chatId) ? ' ← 当前 chat' : ''}`)
+  ];
+  if (filePath) lines.push('', `持久化文件: ${filePath}`);
+  else lines.push('', '⚠️ 未配 SUBSCRIBERS_FILE，重新部署后订阅会丢失');
+  await tg('sendMessage', { chat_id: chatId, text: lines.join('\n') });
+}
+
+async function handleId(chatId: number | string, chatType: string) {
+  await tg('sendMessage', {
+    chat_id: chatId,
+    text: `chat id: ${chatId}\ntype: ${chatType}\n已订阅: ${isSubscribed(chatId) ? '是' : '否'}`
+  });
 }
 
 async function sendMenu(chatId: number | string, prefix = '') {
@@ -275,6 +328,8 @@ async function handleCheckSpreads(chatId: number | string) {
 async function handleStatus(chatId: number | string) {
   const pairs = loadPairs();
   const cache = getCacheStatus();
+  const watcher = getWatcherStatus();
+  const subs = getSubscribers();
   const lines = [
     `🟢 监控状态`,
     `进程内监控: ${globalThis.__spreadMonitorTimer ? '运行中' : '未启动'}`,
@@ -293,6 +348,12 @@ async function handleStatus(chatId: number | string) {
     `更新于: ${cache.fetchedAt || '(尚未)'}（${cache.ageMs == null ? '-' : Math.round(cache.ageMs / 1000) + 's 前'}）`
   ];
   if (cache.lastError) lines.push(`缓存错误: ${cache.lastError}`);
+  lines.push('');
+  lines.push(`🔔 新市场提醒`);
+  lines.push(`监视器: ${watcher.initialized ? '✅ 已初始化' : '⏳ 未初始化'}`);
+  lines.push(`已知 event: ${watcher.knownEvents}`);
+  lines.push(`订阅者: ${subs.length}`);
+  if (watcher.lastNewAt) lines.push(`上次新发现: ${watcher.lastNewAt}（${watcher.lastNewCount} 个）`);
   if (globalThis.__tgBotLastError) lines.push(`Bot 错误: ${globalThis.__tgBotLastError}`);
   await tg('sendMessage', { chat_id: chatId, text: lines.join('\n') });
 }
@@ -304,6 +365,10 @@ async function handleHelp(chatId: number | string) {
     '/menu - 显示主菜单（按钮）',
     '/predict_only - Predict 独有市场（默认只看在派 PP 的，按 event 分组）',
     '/predict_only all - 包含 PP=0 的市场',
+    '/subscribe - 订阅新市场提醒（个人聊天或群组都可以）',
+    '/unsubscribe - 取消订阅',
+    '/subscribers - 查看订阅列表',
+    '/id - 查看当前 chat id',
     '/check - 立即跑一次价差检查',
     '/status - 监控运行状态',
     '/help - 显示这条帮助',
@@ -313,12 +378,24 @@ async function handleHelp(chatId: number | string) {
   await tg('sendMessage', { chat_id: chatId, text });
 }
 
-async function handleCommand(chatId: number | string, command: string, args: string[]) {
+async function handleCommand(chatId: number | string, command: string, args: string[], chatType: string = 'private') {
   const cmd = command.split('@')[0].trim().toLowerCase();
   switch (cmd) {
     case '/start':
     case '/menu':
       await sendMenu(chatId, '👋 欢迎使用 Predict-Poly 监控机器人。\n\n');
+      return;
+    case '/subscribe':
+      await handleSubscribe(chatId, chatType);
+      return;
+    case '/unsubscribe':
+      await handleUnsubscribe(chatId);
+      return;
+    case '/subscribers':
+      await handleSubscribers(chatId);
+      return;
+    case '/id':
+      await handleId(chatId, chatType);
       return;
     case '/predict_only':
     case '/predictonly': {
@@ -354,11 +431,18 @@ async function handleCallback(query: TgCallbackQuery) {
     await tg('sendMessage', { chat_id: chatId, text: '⛔ 未授权。请联系部署者。' });
     return;
   }
+  const chatType = query.message?.chat.type || 'private';
   switch (data) {
     case 'predict_only':
     case 'predict_only_all':
     case 'predict_only_rewards':
       await handlePredictOnly(chatId, true);
+      break;
+    case 'subscribe':
+      await handleSubscribe(chatId, chatType);
+      break;
+    case 'unsubscribe':
+      await handleUnsubscribe(chatId);
       break;
     case 'refresh_cache':
       await handleRefreshCache(chatId);
@@ -377,6 +461,9 @@ async function handleCallback(query: TgCallbackQuery) {
   }
 }
 
+// 这些命令无需 isAllowed 鉴权（用户/群组首次接入需要用）
+const UNAUTHED_COMMANDS = new Set(['/start', '/id', '/subscribe', '/unsubscribe']);
+
 async function handleUpdate(update: TgUpdate) {
   if (update.callback_query) {
     await handleCallback(update.callback_query);
@@ -385,20 +472,23 @@ async function handleUpdate(update: TgUpdate) {
   const msg = update.message;
   if (!msg?.text) return;
   const chatId = msg.chat.id;
-  if (!isAllowed(chatId)) {
+  const chatType = msg.chat.type || 'private';
+  const text = msg.text.trim();
+  const firstTok = text.split(/\s+/)[0].split('@')[0].toLowerCase();
+  const bypassAuth = UNAUTHED_COMMANDS.has(firstTok);
+
+  if (!bypassAuth && !isAllowed(chatId)) {
     await tg('sendMessage', {
       chat_id: chatId,
-      text: `⛔ 未授权。你的 chat id 是 ${chatId}，把它加到 TELEGRAM_CHAT_ID 或 TELEGRAM_ALLOWED_CHAT_IDS 即可。`
+      text: `⛔ 未授权。你的 chat id 是 ${chatId}（${chatType}）。\n直接发 /subscribe 即可订阅新市场提醒。\n要使用其它命令请把这个 id 加到 TELEGRAM_ALLOWED_CHAT_IDS。`
     });
     return;
   }
-  const text = msg.text.trim();
   if (text.startsWith('/')) {
     const tokens = text.split(/\s+/);
-    await handleCommand(chatId, tokens[0], tokens.slice(1));
+    await handleCommand(chatId, tokens[0], tokens.slice(1), chatType);
     return;
   }
-  // non-command message → show menu
   await sendMenu(chatId);
 }
 
@@ -407,7 +497,11 @@ async function registerCommandsMenu() {
     await tg('setMyCommands', {
       commands: [
         { command: 'menu', description: '主菜单' },
-        { command: 'predict_only', description: 'Predict 独有市场（全部）' },
+        { command: 'predict_only', description: 'Predict 独有市场（在派 PP）' },
+        { command: 'subscribe', description: '订阅新市场提醒' },
+        { command: 'unsubscribe', description: '取消订阅' },
+        { command: 'subscribers', description: '查看订阅列表' },
+        { command: 'id', description: '查看当前 chat id' },
         { command: 'refresh', description: '强制刷新缓存' },
         { command: 'check', description: '立即跑一次价差检查' },
         { command: 'status', description: '监控/缓存状态' },
@@ -432,6 +526,7 @@ export function startBotLongPolling(): void {
   globalThis.__tgBotPolling = true;
   console.log('[bot] starting long polling');
 
+  registerAlertSendFn(sendTextToChat);
   void registerCommandsMenu();
 
   const loop = async () => {

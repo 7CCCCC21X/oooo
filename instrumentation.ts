@@ -5,6 +5,10 @@ export async function register() {
   startBackgroundMonitor();
   const { startBotLongPolling } = await import('./lib/telegram-bot');
   startBotLongPolling();
-  const { startBackgroundCacheRefresh } = await import('./lib/predict-cache');
+  const { addRefreshHook, startBackgroundCacheRefresh } = await import('./lib/predict-cache');
+  const { notifyNewMarkets } = await import('./lib/new-markets-alerts');
+  addRefreshHook(async (entry) => {
+    await notifyNewMarkets(entry);
+  });
   startBackgroundCacheRefresh();
 }

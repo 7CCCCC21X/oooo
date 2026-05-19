@@ -16,6 +16,14 @@ declare global {
   var __predictMarketsInflight: Promise<MarketsCacheEntry> | null | undefined;
   var __predictCacheTimer: NodeJS.Timeout | undefined;
   var __predictCacheLastError: string | undefined;
+  var __predictCacheHooks: Array<(entry: MarketsCacheEntry) => Promise<void>> | undefined;
+}
+
+export type RefreshHook = (entry: MarketsCacheEntry) => Promise<void>;
+
+export function addRefreshHook(hook: RefreshHook): void {
+  if (!globalThis.__predictCacheHooks) globalThis.__predictCacheHooks = [];
+  globalThis.__predictCacheHooks.push(hook);
 }
 
 const CACHE_TTL_MS = Number(process.env.PREDICT_CACHE_TTL_MS) || 10 * 60 * 1000;
@@ -76,6 +84,14 @@ export async function refreshMarketsCache(maxPages = MAX_PAGES): Promise<Markets
       globalThis.__predictCacheLastError = undefined;
     }
     console.log(`[predict-cache] refresh done: ${entry.markets.length} markets, ${entry.pagesFetched} pages, ${entry.durationMs}ms, stop=${entry.stoppedReason}`);
+    const hooks = globalThis.__predictCacheHooks || [];
+    for (const hook of hooks) {
+      try {
+        await hook(entry);
+      } catch (err) {
+        console.error('[predict-cache] refresh hook failed:', err instanceof Error ? err.message : err);
+      }
+    }
     return entry;
   })()
     .catch((err) => {
