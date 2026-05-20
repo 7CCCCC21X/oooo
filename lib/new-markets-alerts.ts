@@ -65,8 +65,12 @@ export type NewMarketsResult = {
 };
 
 export async function notifyNewMarkets(entry: MarketsCacheEntry): Promise<NewMarketsResult> {
-  const predictOnly = filterOutNoise(filterPredictOnly(entry.markets)).filter((m) => m.tradeable && m.hourlyRate > 0);
+  const allPredictOnly = filterPredictOnly(entry.markets);
+  const afterNoise = filterOutNoise(allPredictOnly);
+  const noiseRemoved = allPredictOnly.length - afterNoise.length;
+  const predictOnly = afterNoise.filter((m) => m.tradeable && m.hourlyRate > 0);
   let groups = groupMarketsByCategory(predictOnly).filter((g) => g.totalHourlyRate > 0);
+  console.log(`[new-markets] predict-only=${allPredictOnly.length}, noise过滤=${noiseRemoved}, tradeable+PP=${predictOnly.length}, events=${groups.length}`);
 
   const seen = getSeen();
 

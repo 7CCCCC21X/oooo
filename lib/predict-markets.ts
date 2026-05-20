@@ -392,17 +392,25 @@ export function filterPredictOnly(markets: PredictMarketSummary[]): PredictMarke
   return markets.filter((m) => !m.hasPolymarket);
 }
 
-// 噪音市场关键词排除（默认排除高频重复的 "up or down" 类，如 Bitcoin Up or Down）
-// 可用环境变量 EXCLUDE_TITLE_KEYWORDS 覆盖，逗号分隔
+// 噪音市场关键词排除。
+// baseline 始终生效（除非 DISABLE_NOISE_FILTER=1），覆盖高频重复的 "up or down" 类。
+// EXCLUDE_TITLE_KEYWORDS 在 baseline 之上追加更多关键词。
+const BASELINE_NOISE_KEYWORDS = ['up or down', 'updown', 'up-or-down'];
+
 function getExcludeKeywords(): string[] {
+  if (process.env.DISABLE_NOISE_FILTER === '1') return [];
+  const set = new Set<string>(BASELINE_NOISE_KEYWORDS);
   const env = process.env.EXCLUDE_TITLE_KEYWORDS;
-  if (env !== undefined) {
-    return env
-      .split(',')
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean);
+  if (env && env.trim()) {
+    for (const k of env.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)) {
+      set.add(k);
+    }
   }
-  return ['up or down', 'updown'];
+  return [...set];
+}
+
+export function getActiveExcludeKeywords(): string[] {
+  return getExcludeKeywords();
 }
 
 export function isNoiseMarket(m: PredictMarketSummary): boolean {

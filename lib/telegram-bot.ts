@@ -1,6 +1,7 @@
 import {
   filterOutNoise,
   filterPredictOnly,
+  getActiveExcludeKeywords,
   groupMarketsByCategory,
   predictMarketUrl
 } from './predict-markets';
@@ -377,6 +378,7 @@ async function handleStatus(chatId: number | string, threadId: number | null) {
   lines.push(`监视器: ${watcher.initialized ? '✅ 已初始化' : '⏳ 未初始化'}`);
   lines.push(`已知 event: ${watcher.knownEvents}`);
   lines.push(`订阅者: ${subs.length}`);
+  lines.push(`噪音过滤词: ${getActiveExcludeKeywords().join(', ') || '(已关闭)'}`);
   if (watcher.lastNewAt) lines.push(`上次新发现: ${watcher.lastNewAt}（${watcher.lastNewCount} 个）`);
   if (globalThis.__tgBotLastError) lines.push(`Bot 错误: ${globalThis.__tgBotLastError}`);
   await reply(chatId, threadId, lines.join('\n'));
