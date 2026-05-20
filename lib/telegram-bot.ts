@@ -34,12 +34,12 @@ type TgMessage = {
 type TgCallbackQuery = { id: string; from: TgUser; message?: TgMessage; data?: string };
 type TgUpdate = { update_id: number; message?: TgMessage; callback_query?: TgCallbackQuery };
 
-// 话题群：发消息必须带 message_thread_id 才能发到指定话题，否则进 General
+// 话题群：发消息必须带 message_thread_id 才能发到指定话题，否则进 General。
+// 只要 Telegram 给了 message_thread_id 就用（话题里的消息都会带），
+// 不强求 is_topic_message（部分客户端/General 不一定设）。
 function threadOf(msg?: TgMessage): number | null {
   if (!msg) return null;
-  if (msg.is_topic_message && typeof msg.message_thread_id === 'number') return msg.message_thread_id;
-  // 有些客户端即使非 forum 也带 thread_id；只在确实是话题消息时用
-  return typeof msg.message_thread_id === 'number' && msg.is_topic_message ? msg.message_thread_id : null;
+  return typeof msg.message_thread_id === 'number' ? msg.message_thread_id : null;
 }
 
 async function tg(method: string, params: any, timeoutMs = 35_000): Promise<any> {
