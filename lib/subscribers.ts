@@ -21,12 +21,9 @@ function load(): Map<string, Subscription> {
   const seed = (chatId: string, threadId: number | null) => {
     map.set(keyOf(chatId, threadId), { chatId, threadId });
   };
-  const main = String(process.env.TELEGRAM_CHAT_ID || '').trim();
-  if (main) seed(main, null);
-  const extra = String(process.env.TELEGRAM_ALLOWED_CHAT_IDS || '').trim();
-  if (extra) {
-    for (const id of extra.split(/[\s,]+/).filter(Boolean)) seed(id.trim(), null);
-  }
+  // 注意：不再自动 seed TELEGRAM_CHAT_ID / TELEGRAM_ALLOWED_CHAT_IDS。
+  // 那两个只做权限白名单，不应自动订阅，否则提醒会跑到默认话题。
+  // 订阅完全来自 /subscribe（记录 chatId + threadId）和 SUBSCRIBERS_FILE。
   const f = filePath();
   if (f) {
     try {

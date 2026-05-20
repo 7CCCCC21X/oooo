@@ -64,15 +64,24 @@ function formatAlertMessage(alerts: SpreadResult[]): string {
   return [header, ...body].join('\n\n').slice(0, 3900);
 }
 
+function telegramThreadId(): number | null {
+  const raw = String(process.env.TELEGRAM_THREAD_ID || process.env.TELEGRAM_MESSAGE_THREAD_ID || '').trim();
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
 async function sendTelegram(text: string): Promise<boolean> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!token || !chatId) return false;
+  const threadId = telegramThreadId();
   const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       chat_id: chatId,
+      ...(threadId !== null ? { message_thread_id: threadId } : {}),
       text,
       disable_web_page_preview: true
     })

@@ -27,11 +27,18 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ ok: false, error: 'TELEGRAM_CHAT_ID is not set in env' }, { status: 400 });
   }
 
+  const threadRaw = String(process.env.TELEGRAM_THREAD_ID || process.env.TELEGRAM_MESSAGE_THREAD_ID || '').trim();
+  const threadId = threadRaw && Number.isFinite(Number(threadRaw)) ? Number(threadRaw) : null;
   try {
     const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true })
+      body: JSON.stringify({
+        chat_id: chatId,
+        ...(threadId !== null ? { message_thread_id: threadId } : {}),
+        text,
+        disable_web_page_preview: true
+      })
     });
     const body = await response.text();
     let parsed: unknown = null;
