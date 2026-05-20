@@ -5,7 +5,7 @@ import {
   predictMarketUrl
 } from './predict-markets';
 import { getCacheStatus, getMarketsCachedOrFetch, refreshMarketsCache } from './predict-cache';
-import { addSubscriber, getSubscribers, isSubscribed, removeSubscriber, getSubscribersFilePath } from './subscribers';
+import { addSubscriber, getSubscriptions, isSubscribed, removeSubscriber, getSubscribersFilePath } from './subscribers';
 import { getWatcherStatus, registerAlertSendFn } from './new-markets-alerts';
 import { runMonitorCycle } from './monitor';
 import { loadPairs } from './pairs';
@@ -21,9 +21,25 @@ const TG_API = 'https://api.telegram.org';
 
 type TgUser = { id: number; first_name?: string; username?: string };
 type TgChat = { id: number; type: string; title?: string; username?: string };
-type TgMessage = { message_id: number; from?: TgUser; chat: TgChat; date: number; text?: string };
+type TgMessage = {
+  message_id: number;
+  from?: TgUser;
+  chat: TgChat;
+  date: number;
+  text?: string;
+  message_thread_id?: number;
+  is_topic_message?: boolean;
+};
 type TgCallbackQuery = { id: string; from: TgUser; message?: TgMessage; data?: string };
 type TgUpdate = { update_id: number; message?: TgMessage; callback_query?: TgCallbackQuery };
+
+// 话题群：发消息必须带 message_thread_id 才能发到指定话题，否则进 General
+function threadOf(msg?: TgMessage): number | null {
+  if (!msg) return null;
+  if (msg.is_topic_message && typeof msg.message_thread_id === 'number') return msg.message_thread_id;
+  // 有些客户端即使非 forum 也带 thread_id；只在确实是话题消息时用
+  return typeof msg.message_thread_id === 'number' && msg.is_topic_message ? msg.message_thread_id : null;
+}
 
 async function tg(method: string, params: any, timeoutMs = 35_000): Promise<any> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -49,19 +65,33 @@ async function tg(method: string, params: any, timeoutMs = 35_000): Promise<any>
   }
 }
 
-export async function sendTextToChat(chatId: string, text: string): Promise<void> {
+// 统一的发送助手：带 threadId 时发到指定话题
+async function reply(chatId: number | string, threadId: number | null, text: string, extra: any = {}): Promise<void> {
   await tg('sendMessage', {
     chat_id: chatId,
+    ...(threadId ? { message_thread_id: threadId } : {}),
     text: text.slice(0, 3900),
-    disable_web_page_preview: true
+    disable_web_page_preview: true,
+    ...extra
   });
 }
 
-async function tgSendDocument(chatId: number | string, filename: string, content: string, caption?: string): Promise<void> {
+export async function sendTextToChat(chatId: string, text: string, threadId: number | null = null): Promise<void> {
+  await reply(chatId, threadId, text);
+}
+
+async function tgSendDocument(
+  chatId: number | string,
+  threadId: number | null,
+  filename: string,
+  content: string,
+  caption?: string
+): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) throw new Error('Missing TELEGRAM_BOT_TOKEN');
   const form = new FormData();
   form.append('chat_id', String(chatId));
+  if (threadId) form.append('message_thread_id', String(threadId));
   if (caption) form.append('caption', caption.slice(0, 1024));
   const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
   form.append('document', blob, filename);
@@ -123,58 +153,64 @@ const MENU_KEYBOARD = {
   ]
 };
 
-async function handleRefreshCache(chatId: number | string) {
-  await tg('sendMessage', { chat_id: chatId, text: '🔄 已触发后台刷新缓存，60~180 秒后再点查询即可。' });
+async function handleRefreshCache(chatId: number | string, threadId: number | null) {
+  await reply(chatId, threadId, '🔄 已触发后台刷新缓存，60~180 秒后再点查询即可。');
   refreshMarketsCache().catch(() => {});
 }
 
-async function handleSubscribe(chatId: number | string, chatType: string) {
-  const added = addSubscriber(chatId);
-  await tg('sendMessage', {
-    chat_id: chatId,
-    text: added
-      ? `✅ 已订阅新市场提醒\n\nchat id: ${chatId}（${chatType}）\n\n当 predict.fun 出现新的「未结束 + 在派 PP」独有市场，会自动推送到这里。\n用 /unsubscribe 取消。`
-      : `这个 chat 已经订阅了。\nchat id: ${chatId}`
-  });
+async function handleSubscribe(chatId: number | string, threadId: number | null, chatType: string) {
+  const added = addSubscriber(chatId, threadId);
+  const loc = threadId ? `\n话题 thread_id: ${threadId}` : '';
+  await reply(
+    chatId,
+    threadId,
+    added
+      ? `✅ 已订阅新市场提醒\n\nchat id: ${chatId}（${chatType}）${loc}\n\n当 predict.fun 出现新的「未结束 + 在派 PP」独有市场，会自动推送到${threadId ? '这个话题' : '这里'}。\n用 /unsubscribe 取消。`
+      : `这个${threadId ? '话题' : 'chat'}已经订阅了。\nchat id: ${chatId}${loc}`
+  );
 }
 
-async function handleUnsubscribe(chatId: number | string) {
-  const removed = removeSubscriber(chatId);
-  await tg('sendMessage', {
-    chat_id: chatId,
-    text: removed
-      ? `🔕 已取消订阅。\nchat id: ${chatId}`
-      : `这个 chat 没在订阅列表里。\nchat id: ${chatId}`
-  });
+async function handleUnsubscribe(chatId: number | string, threadId: number | null) {
+  const removed = removeSubscriber(chatId, threadId);
+  const loc = threadId ? `\nthread_id: ${threadId}` : '';
+  await reply(
+    chatId,
+    threadId,
+    removed ? `🔕 已取消订阅。\nchat id: ${chatId}${loc}` : `这个${threadId ? '话题' : 'chat'}没在订阅列表里。\nchat id: ${chatId}${loc}`
+  );
 }
 
-async function handleSubscribers(chatId: number | string) {
-  const subs = getSubscribers();
+async function handleSubscribers(chatId: number | string, threadId: number | null) {
+  const subs = getSubscriptions();
   const filePath = getSubscribersFilePath();
   const lines = [
-    `📬 订阅者列表 (${subs.length})`,
-    ...subs.map((s, i) => `${i + 1}. ${s}${String(s) === String(chatId) ? ' ← 当前 chat' : ''}`)
+    `📬 订阅列表 (${subs.length})`,
+    ...subs.map((s, i) => {
+      const here = String(s.chatId) === String(chatId) && (s.threadId ?? null) === (threadId ?? null);
+      const t = s.threadId ? ` (话题 ${s.threadId})` : '';
+      return `${i + 1}. ${s.chatId}${t}${here ? ' ← 当前' : ''}`;
+    })
   ];
   if (filePath) lines.push('', `持久化文件: ${filePath}`);
   else lines.push('', '⚠️ 未配 SUBSCRIBERS_FILE，重新部署后订阅会丢失');
-  await tg('sendMessage', { chat_id: chatId, text: lines.join('\n') });
+  await reply(chatId, threadId, lines.join('\n'));
 }
 
-async function handleId(chatId: number | string, chatType: string) {
-  await tg('sendMessage', {
-    chat_id: chatId,
-    text: `chat id: ${chatId}\ntype: ${chatType}\n已订阅: ${isSubscribed(chatId) ? '是' : '否'}`
-  });
+async function handleId(chatId: number | string, threadId: number | null, chatType: string) {
+  await reply(
+    chatId,
+    threadId,
+    `chat id: ${chatId}\ntype: ${chatType}\nthread_id: ${threadId ?? '(无/General)'}\n已订阅: ${isSubscribed(chatId, threadId) ? '是' : '否'}`
+  );
 }
 
-async function sendMenu(chatId: number | string, prefix = '') {
-  const text = `${prefix}请选择操作：`;
-  await tg('sendMessage', { chat_id: chatId, text, reply_markup: MENU_KEYBOARD });
+async function sendMenu(chatId: number | string, threadId: number | null, prefix = '') {
+  await reply(chatId, threadId, `${prefix}请选择操作：`, { reply_markup: MENU_KEYBOARD });
 }
 
-async function sendInChunks(chatId: number | string, header: string, items: string[]) {
+async function sendInChunks(chatId: number | string, threadId: number | null, header: string, items: string[]) {
   if (!items.length) {
-    await tg('sendMessage', { chat_id: chatId, text: header, disable_web_page_preview: true });
+    await reply(chatId, threadId, header);
     return;
   }
   const MAX = 3800;
@@ -193,25 +229,21 @@ async function sendInChunks(chatId: number | string, header: string, items: stri
   // throttle 避免 TG 429（每秒最多 1 条消息到同一 chat）
   for (let i = 0; i < messages.length; i++) {
     if (i > 0) await new Promise((r) => setTimeout(r, 1200));
-    await tg('sendMessage', { chat_id: chatId, text: messages[i], disable_web_page_preview: true });
+    await reply(chatId, threadId, messages[i]);
   }
 }
 
-async function handlePredictOnly(chatId: number | string, onlyRewards = true) {
+async function handlePredictOnly(chatId: number | string, threadId: number | null, onlyRewards = true) {
   const status = getCacheStatus();
   if (!status.hasCache) {
-    await tg('sendMessage', {
-      chat_id: chatId,
-      text: '⏳ 首次拉取 predict.fun 全量市场缓存中...（一次性 60-180 秒，之后查询秒回）'
-    });
+    await reply(chatId, threadId, '⏳ 首次拉取 predict.fun 全量市场缓存中...（一次性 60-180 秒，之后查询秒回）');
   } else if (status.ageMs && status.ageMs > (status.ttlMs || 600000)) {
-    await tg('sendMessage', { chat_id: chatId, text: '⏳ 使用缓存（已触发后台刷新）...' });
+    await reply(chatId, threadId, '⏳ 使用缓存（已触发后台刷新）...');
   }
   try {
     const entry = await getMarketsCachedOrFetch();
     const { markets, pagesFetched, stoppedReason, totalCategories, totalUniqueMarketIds, fetchedAt, durationMs } = entry;
     let predictOnly = filterOutNoise(filterPredictOnly(markets));
-    // 默认只显示「未结束 + 在派 PP」的市场
     predictOnly = predictOnly.filter((m) => m.tradeable);
     if (onlyRewards) {
       predictOnly = predictOnly.filter((m) => m.hourlyRate > 0);
@@ -219,33 +251,31 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = true) {
     predictOnly.sort((a, b) => (b.hourlyRate || 0) - (a.hourlyRate || 0));
     if (!predictOnly.length) {
       const withPoly = markets.length - filterPredictOnly(markets).length;
-      await tg('sendMessage', {
-        chat_id: chatId,
-        text: `没找到 predict 独有市场（在派 PP）。\nsource: /v1/categories (cached at ${fetchedAt})\n抓取: ${pagesFetched} 页 (stop=${stoppedReason})\n类目数: ${totalCategories}\n市场数: ${totalUniqueMarketIds}\n通过 tradeable+PP 过滤: ${predictOnly.length}\n其中 polymarket 映射: ${withPoly}`
-      });
+      await reply(
+        chatId,
+        threadId,
+        `没找到 predict 独有市场（在派 PP）。\nsource: /v1/categories (cached at ${fetchedAt})\n抓取: ${pagesFetched} 页 (stop=${stoppedReason})\n类目数: ${totalCategories}\n市场数: ${totalUniqueMarketIds}\n通过 tradeable+PP 过滤: ${predictOnly.length}\n其中 polymarket 映射: ${withPoly}`
+      );
       return;
     }
     void durationMs;
     void fetchedAt;
     const totalFound = predictOnly.length;
-    // 按 event (categorySlug) 分组
     let groups = groupMarketsByCategory(predictOnly);
-    // event 总 PP/h = 0 的也丢掉
     groups = groups.filter((g) => g.totalHourlyRate > 0);
     groups.sort((a, b) => (b.totalHourlyRate || 0) - (a.totalHourlyRate || 0));
     if (!groups.length) {
-      await tg('sendMessage', { chat_id: chatId, text: `没找到正在派 PP 的 predict 独有 event。` });
+      await reply(chatId, threadId, `没找到正在派 PP 的 predict 独有 event。`);
       return;
     }
     const totalPP = groups.reduce((s, g) => s + g.totalHourlyRate, 0);
     const header = `📊 Predict 独有市场（在派 PP）\n共 ${groups.length} 个 event / ${totalFound} 个市场\n总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）\n`;
 
-    const MAX_OPTIONS_INLINE = 12; // 单个 event 内嵌选项上限
+    const MAX_OPTIONS_INLINE = 12;
     const items = groups.map((g, i) => {
       const remain = fmtRemaining(g.endMs);
       const lines = [`${i + 1}. ${g.title}`];
-      const ppLine = `   总 PP/h: ${fmt(g.totalHourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}`;
-      lines.push(ppLine);
+      lines.push(`   总 PP/h: ${fmt(g.totalHourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}`);
       if (g.markets.length > 1) {
         const shown = g.markets.slice(0, MAX_OPTIONS_INLINE);
         lines.push(`   选项 (${g.markets.length}):`);
@@ -261,9 +291,8 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = true) {
       return lines.join('\n');
     });
 
-    await sendInChunks(chatId, header, items);
+    await sendInChunks(chatId, threadId, header, items);
 
-    // 如果 event 数量超大（>200），同时给一份完整 .txt 附件兜底
     if (groups.length > 200) {
       const fileLines = [
         `Predict 独有市场（未结束）— 按 event 分组`,
@@ -285,18 +314,15 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = true) {
       }
       const date = new Date().toISOString().slice(0, 10);
       const filename = `predict-only-grouped-${date}.txt`;
-      await tgSendDocument(chatId, filename, fileLines.join('\n'), `📎 完整 ${groups.length} 个 event`);
+      await tgSendDocument(chatId, threadId, filename, fileLines.join('\n'), `📎 完整 ${groups.length} 个 event`);
     }
   } catch (err) {
-    await tg('sendMessage', {
-      chat_id: chatId,
-      text: `❌ 拉取失败: ${err instanceof Error ? err.message : String(err)}`
-    });
+    await reply(chatId, threadId, `❌ 拉取失败: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
-async function handleCheckSpreads(chatId: number | string) {
-  await tg('sendMessage', { chat_id: chatId, text: '⏳ 正在跑一次价差检查...' });
+async function handleCheckSpreads(chatId: number | string, threadId: number | null) {
+  await reply(chatId, threadId, '⏳ 正在跑一次价差检查...');
   try {
     const result = await runMonitorCycle();
     const lines = [
@@ -317,20 +343,17 @@ async function handleCheckSpreads(chatId: number | string) {
         lines.push(`  gap: ${fmt(best.gap, 4)} = ${fmt(best.gapCents, 2)}¢ (阈值 ${fmt(best.threshold, 4)})`);
       }
     }
-    await tg('sendMessage', { chat_id: chatId, text: lines.join('\n') });
+    await reply(chatId, threadId, lines.join('\n'));
   } catch (err) {
-    await tg('sendMessage', {
-      chat_id: chatId,
-      text: `❌ 检查失败: ${err instanceof Error ? err.message : String(err)}`
-    });
+    await reply(chatId, threadId, `❌ 检查失败: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
-async function handleStatus(chatId: number | string) {
+async function handleStatus(chatId: number | string, threadId: number | null) {
   const pairs = loadPairs();
   const cache = getCacheStatus();
   const watcher = getWatcherStatus();
-  const subs = getSubscribers();
+  const subs = getSubscriptions();
   const lines = [
     `🟢 监控状态`,
     `进程内监控: ${globalThis.__spreadMonitorTimer ? '运行中' : '未启动'}`,
@@ -356,80 +379,86 @@ async function handleStatus(chatId: number | string) {
   lines.push(`订阅者: ${subs.length}`);
   if (watcher.lastNewAt) lines.push(`上次新发现: ${watcher.lastNewAt}（${watcher.lastNewCount} 个）`);
   if (globalThis.__tgBotLastError) lines.push(`Bot 错误: ${globalThis.__tgBotLastError}`);
-  await tg('sendMessage', { chat_id: chatId, text: lines.join('\n') });
+  await reply(chatId, threadId, lines.join('\n'));
 }
 
-async function handleHelp(chatId: number | string) {
+async function handleHelp(chatId: number | string, threadId: number | null) {
   const text = [
     '🤖 命令列表',
     '',
     '/menu - 显示主菜单（按钮）',
     '/predict_only - Predict 独有市场（默认只看在派 PP 的，按 event 分组）',
     '/predict_only all - 包含 PP=0 的市场',
-    '/subscribe - 订阅新市场提醒（个人聊天或群组都可以）',
+    '/subscribe - 订阅新市场提醒（个人/群组/话题都可以）',
     '/unsubscribe - 取消订阅',
     '/subscribers - 查看订阅列表',
-    '/id - 查看当前 chat id',
+    '/id - 查看当前 chat id 和 thread_id',
     '/check - 立即跑一次价差检查',
     '/status - 监控运行状态',
     '/help - 显示这条帮助',
     '',
-    '价差触发时会自动推送提醒（同一组合 cooldown 内不重复）。'
+    '话题群：在目标话题里发 /subscribe，提醒就发到那个话题。'
   ].join('\n');
-  await tg('sendMessage', { chat_id: chatId, text });
+  await reply(chatId, threadId, text);
 }
 
-async function handleCommand(chatId: number | string, command: string, args: string[], chatType: string = 'private') {
+async function handleCommand(
+  chatId: number | string,
+  threadId: number | null,
+  command: string,
+  args: string[],
+  chatType: string = 'private'
+) {
   const cmd = command.split('@')[0].trim().toLowerCase();
   switch (cmd) {
     case '/start':
     case '/menu':
-      await sendMenu(chatId, '👋 欢迎使用 Predict-Poly 监控机器人。\n\n');
+      await sendMenu(chatId, threadId, '👋 欢迎使用 Predict-Poly 监控机器人。\n\n');
       return;
     case '/subscribe':
-      await handleSubscribe(chatId, chatType);
+      await handleSubscribe(chatId, threadId, chatType);
       return;
     case '/unsubscribe':
-      await handleUnsubscribe(chatId);
+      await handleUnsubscribe(chatId, threadId);
       return;
     case '/subscribers':
-      await handleSubscribers(chatId);
+      await handleSubscribers(chatId, threadId);
       return;
     case '/id':
-      await handleId(chatId, chatType);
+      await handleId(chatId, threadId, chatType);
       return;
     case '/predict_only':
     case '/predictonly': {
-      // 默认只看在派 PP 的；传 all 才包含 PP=0 的
       const includeZeroPP = args.some((a) => a.toLowerCase() === 'all' || a.toLowerCase() === '全部');
-      await handlePredictOnly(chatId, !includeZeroPP);
+      await handlePredictOnly(chatId, threadId, !includeZeroPP);
       return;
     }
     case '/check':
     case '/spreads':
-      await handleCheckSpreads(chatId);
+      await handleCheckSpreads(chatId, threadId);
       return;
     case '/refresh':
-      await handleRefreshCache(chatId);
+      await handleRefreshCache(chatId, threadId);
       return;
     case '/status':
-      await handleStatus(chatId);
+      await handleStatus(chatId, threadId);
       return;
     case '/help':
-      await handleHelp(chatId);
+      await handleHelp(chatId, threadId);
       return;
     default:
-      await tg('sendMessage', { chat_id: chatId, text: `未知命令: ${cmd}\n发 /menu 看主菜单，或 /help 看命令列表。` });
+      await reply(chatId, threadId, `未知命令: ${cmd}\n发 /menu 看主菜单，或 /help 看命令列表。`);
   }
 }
 
 async function handleCallback(query: TgCallbackQuery) {
   const data = query.data || '';
   const chatId = query.message?.chat.id;
+  const threadId = threadOf(query.message);
   await tg('answerCallbackQuery', { callback_query_id: query.id });
   if (!chatId) return;
   if (!isAllowed(chatId)) {
-    await tg('sendMessage', { chat_id: chatId, text: '⛔ 未授权。请联系部署者。' });
+    await reply(chatId, threadId, '⛔ 未授权。请联系部署者。');
     return;
   }
   const chatType = query.message?.chat.type || 'private';
@@ -437,32 +466,32 @@ async function handleCallback(query: TgCallbackQuery) {
     case 'predict_only':
     case 'predict_only_all':
     case 'predict_only_rewards':
-      await handlePredictOnly(chatId, true);
+      await handlePredictOnly(chatId, threadId, true);
       break;
     case 'subscribe':
-      await handleSubscribe(chatId, chatType);
+      await handleSubscribe(chatId, threadId, chatType);
       break;
     case 'unsubscribe':
-      await handleUnsubscribe(chatId);
+      await handleUnsubscribe(chatId, threadId);
       break;
     case 'refresh_cache':
-      await handleRefreshCache(chatId);
+      await handleRefreshCache(chatId, threadId);
       break;
     case 'check_spreads':
-      await handleCheckSpreads(chatId);
+      await handleCheckSpreads(chatId, threadId);
       break;
     case 'status':
-      await handleStatus(chatId);
+      await handleStatus(chatId, threadId);
       break;
     case 'help':
-      await handleHelp(chatId);
+      await handleHelp(chatId, threadId);
       break;
     default:
-      await tg('sendMessage', { chat_id: chatId, text: `未知按钮: ${data}` });
+      await reply(chatId, threadId, `未知按钮: ${data}`);
   }
 }
 
-// 这些命令无需 isAllowed 鉴权（用户/群组首次接入需要用）
+// 这些命令无需 isAllowed 鉴权（用户/群组/话题首次接入需要用）
 const UNAUTHED_COMMANDS = new Set(['/start', '/id', '/subscribe', '/unsubscribe']);
 
 async function handleUpdate(update: TgUpdate) {
@@ -473,24 +502,26 @@ async function handleUpdate(update: TgUpdate) {
   const msg = update.message;
   if (!msg?.text) return;
   const chatId = msg.chat.id;
+  const threadId = threadOf(msg);
   const chatType = msg.chat.type || 'private';
   const text = msg.text.trim();
   const firstTok = text.split(/\s+/)[0].split('@')[0].toLowerCase();
   const bypassAuth = UNAUTHED_COMMANDS.has(firstTok);
 
   if (!bypassAuth && !isAllowed(chatId)) {
-    await tg('sendMessage', {
-      chat_id: chatId,
-      text: `⛔ 未授权。你的 chat id 是 ${chatId}（${chatType}）。\n直接发 /subscribe 即可订阅新市场提醒。\n要使用其它命令请把这个 id 加到 TELEGRAM_ALLOWED_CHAT_IDS。`
-    });
+    await reply(
+      chatId,
+      threadId,
+      `⛔ 未授权。你的 chat id 是 ${chatId}（${chatType}）${threadId ? `\nthread_id: ${threadId}` : ''}。\n直接发 /subscribe 即可订阅新市场提醒。\n要使用其它命令请把这个 id 加到 TELEGRAM_ALLOWED_CHAT_IDS。`
+    );
     return;
   }
   if (text.startsWith('/')) {
     const tokens = text.split(/\s+/);
-    await handleCommand(chatId, tokens[0], tokens.slice(1), chatType);
+    await handleCommand(chatId, threadId, tokens[0], tokens.slice(1), chatType);
     return;
   }
-  await sendMenu(chatId);
+  await sendMenu(chatId, threadId);
 }
 
 async function registerCommandsMenu() {

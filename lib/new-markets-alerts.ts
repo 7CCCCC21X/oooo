@@ -1,5 +1,5 @@
 import { filterOutNoise, filterPredictOnly, groupMarketsByCategory, type MarketGroup } from './predict-markets';
-import { getSubscribers } from './subscribers';
+import { getSubscriptions } from './subscribers';
 import type { MarketsCacheEntry } from './predict-cache';
 
 declare global {
@@ -50,7 +50,7 @@ function buildMessage(g: MarketGroup, idx: number, total: number): string {
   return lines.join('\n');
 }
 
-export type AlertSendFn = (chatId: string, text: string) => Promise<void>;
+export type AlertSendFn = (chatId: string, text: string, threadId: number | null) => Promise<void>;
 
 let registeredSendFn: AlertSendFn | null = null;
 export function registerAlertSendFn(fn: AlertSendFn) {
@@ -99,23 +99,23 @@ export async function notifyNewMarkets(entry: MarketsCacheEntry): Promise<NewMar
     return { totalEvents: groups.length, newCount: newGroups.length, notified: 0, initial: false };
   }
 
-  const subs = getSubscribers();
+  const subs = getSubscriptions();
   if (!subs.length) {
     console.log(`[new-markets] ${newGroups.length} new events, but no subscribers`);
     return { totalEvents: groups.length, newCount: newGroups.length, notified: 0, initial: false };
   }
 
-  console.log(`[new-markets] ${newGroups.length} new events → ${subs.length} subscribers`);
+  console.log(`[new-markets] ${newGroups.length} new events → ${subs.length} subscriptions`);
   let notified = 0;
   for (let i = 0; i < newGroups.length; i++) {
     const text = buildMessage(newGroups[i], i + 1, newGroups.length);
-    for (const chat of subs) {
+    for (const sub of subs) {
       try {
-        await registeredSendFn(chat, text);
+        await registeredSendFn(sub.chatId, text, sub.threadId);
         notified += 1;
         await new Promise((r) => setTimeout(r, 1200));
       } catch (err) {
-        console.error(`[new-markets] send to ${chat} failed:`, err instanceof Error ? err.message : err);
+        console.error(`[new-markets] send to ${sub.chatId}:${sub.threadId} failed:`, err instanceof Error ? err.message : err);
       }
     }
   }
