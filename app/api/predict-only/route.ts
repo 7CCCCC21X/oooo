@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import {
   fetchAllPredictMarkets,
   fetchAllPredictMarketsViaCategories,
+  filterOutNoise,
   filterPredictOnly
 } from '@/lib/predict-markets';
 import { getCachedMarkets, getCacheStatus, refreshMarketsCache, getMarketsCachedOrFetch } from '@/lib/predict-cache';
@@ -79,7 +80,9 @@ export async function GET(request: Request) {
       cacheInfo = getCacheStatus();
     }
 
+    const includeNoise = url.searchParams.get('includeNoise') === '1';
     let predictOnly = filterPredictOnly(markets);
+    if (!includeNoise) predictOnly = filterOutNoise(predictOnly);
     if (hasActiveRewards) {
       predictOnly = predictOnly.filter((m) => m.hourlyRate > 0);
     }

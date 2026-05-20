@@ -1,4 +1,4 @@
-import { filterPredictOnly, groupMarketsByCategory, type MarketGroup } from './predict-markets';
+import { filterOutNoise, filterPredictOnly, groupMarketsByCategory, type MarketGroup } from './predict-markets';
 import { getSubscribers } from './subscribers';
 import type { MarketsCacheEntry } from './predict-cache';
 
@@ -65,7 +65,7 @@ export type NewMarketsResult = {
 };
 
 export async function notifyNewMarkets(entry: MarketsCacheEntry): Promise<NewMarketsResult> {
-  const predictOnly = filterPredictOnly(entry.markets).filter((m) => m.tradeable && m.hourlyRate > 0);
+  const predictOnly = filterOutNoise(filterPredictOnly(entry.markets)).filter((m) => m.tradeable && m.hourlyRate > 0);
   let groups = groupMarketsByCategory(predictOnly).filter((g) => g.totalHourlyRate > 0);
 
   const seen = getSeen();

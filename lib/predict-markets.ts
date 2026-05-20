@@ -392,6 +392,35 @@ export function filterPredictOnly(markets: PredictMarketSummary[]): PredictMarke
   return markets.filter((m) => !m.hasPolymarket);
 }
 
+// 噪音市场关键词排除（默认排除高频重复的 "up or down" 类，如 Bitcoin Up or Down）
+// 可用环境变量 EXCLUDE_TITLE_KEYWORDS 覆盖，逗号分隔
+function getExcludeKeywords(): string[] {
+  const env = process.env.EXCLUDE_TITLE_KEYWORDS;
+  if (env !== undefined) {
+    return env
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+  }
+  return ['up or down', 'updown'];
+}
+
+export function isNoiseMarket(m: PredictMarketSummary): boolean {
+  const keywords = getExcludeKeywords();
+  if (!keywords.length) return false;
+  const blob = [m.title, m.categoryTitle, m.category, m.categorySlug, m.slug]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  return keywords.some((k) => blob.includes(k));
+}
+
+export function filterOutNoise(markets: PredictMarketSummary[]): PredictMarketSummary[] {
+  const keywords = getExcludeKeywords();
+  if (!keywords.length) return markets;
+  return markets.filter((m) => !isNoiseMarket(m));
+}
+
 export type MarketGroup = {
   slug: string;
   title: string;

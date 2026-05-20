@@ -1,4 +1,5 @@
 import {
+  filterOutNoise,
   filterPredictOnly,
   groupMarketsByCategory,
   predictMarketUrl
@@ -209,7 +210,7 @@ async function handlePredictOnly(chatId: number | string, onlyRewards = true) {
   try {
     const entry = await getMarketsCachedOrFetch();
     const { markets, pagesFetched, stoppedReason, totalCategories, totalUniqueMarketIds, fetchedAt, durationMs } = entry;
-    let predictOnly = filterPredictOnly(markets);
+    let predictOnly = filterOutNoise(filterPredictOnly(markets));
     // 默认只显示「未结束 + 在派 PP」的市场
     predictOnly = predictOnly.filter((m) => m.tradeable);
     if (onlyRewards) {
