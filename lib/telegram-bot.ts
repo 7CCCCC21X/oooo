@@ -10,6 +10,7 @@ import { addSubscriber, getSubscriptions, isSubscribed, removeSubscriber, getSub
 import { getWatcherStatus, registerAlertSendFn } from './new-markets-alerts';
 import { runMonitorCycle } from './monitor';
 import { loadPairs } from './pairs';
+import { CODE_VERSION } from './version';
 
 declare global {
   var __tgBotPolling: boolean | undefined;
@@ -23,7 +24,6 @@ const TG_API = 'https://api.telegram.org';
 // 实例指纹：每个进程启动随机生成。用于诊断是否有多实例 / 旧版本在跑。
 const INSTANCE_ID = Math.random().toString(36).slice(2, 8);
 const INSTANCE_STARTED = new Date().toISOString();
-const CODE_VERSION = 'topics-v3-threadid-noisefilter'; // 改代码时手动 bump，便于确认部署是否生效
 
 type TgUser = { id: number; first_name?: string; username?: string };
 type TgChat = { id: number; type: string; title?: string; username?: string };
