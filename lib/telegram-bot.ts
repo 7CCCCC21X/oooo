@@ -20,6 +20,11 @@ declare global {
 
 const TG_API = 'https://api.telegram.org';
 
+// 实例指纹：每个进程启动随机生成。用于诊断是否有多实例 / 旧版本在跑。
+const INSTANCE_ID = Math.random().toString(36).slice(2, 8);
+const INSTANCE_STARTED = new Date().toISOString();
+const CODE_VERSION = 'topics-v3-threadid-noisefilter'; // 改代码时手动 bump，便于确认部署是否生效
+
 type TgUser = { id: number; first_name?: string; username?: string };
 type TgChat = { id: number; type: string; title?: string; username?: string };
 type TgMessage = {
@@ -201,7 +206,7 @@ async function handleId(chatId: number | string, threadId: number | null, chatTy
   await reply(
     chatId,
     threadId,
-    `chat id: ${chatId}\ntype: ${chatType}\nthread_id: ${threadId ?? '(无/General)'}\n已订阅: ${isSubscribed(chatId, threadId) ? '是' : '否'}`
+    `chat id: ${chatId}\ntype: ${chatType}\nthread_id: ${threadId ?? '(无/General)'}\n已订阅: ${isSubscribed(chatId, threadId) ? '是' : '否'}\n---\n实例: ${INSTANCE_ID}\n启动: ${INSTANCE_STARTED}\n版本: ${CODE_VERSION}`
   );
 }
 
@@ -558,7 +563,7 @@ export function startBotLongPolling(): void {
     return;
   }
   globalThis.__tgBotPolling = true;
-  console.log('[bot] starting long polling');
+  console.log(`[bot] starting long polling — instance=${INSTANCE_ID} version=${CODE_VERSION} started=${INSTANCE_STARTED}`);
 
   registerAlertSendFn(sendTextToChat);
   void registerCommandsMenu();
