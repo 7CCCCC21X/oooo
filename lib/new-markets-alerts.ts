@@ -58,13 +58,49 @@ function groupHasPolymarket(g: MarketGroup): boolean {
   return g.markets.some((m) => m.hasPolymarket);
 }
 
+// 电竞赛事名（标题一般是 "Counter-Strike: A vs B (BO3) - ..." 这种）
+const ESPORTS_GAMES = [
+  'counter-strike', 'counter strike', 'cs2', 'cs:go', 'csgo',
+  'league of legends', 'lol', 'dota 2', 'dota2', 'dota',
+  'valorant', 'overwatch', 'rainbow six', 'rainbow 6',
+  'starcraft', 'rocket league', 'mobile legends', 'mlbb', 'pubg',
+  'honor of kings', 'king of glory', 'wild rift', 'apex legends',
+  'call of duty'
+];
+// slug 前缀，如 cs2-mglz-tl1 / lol-dnf-drx / dota2-tundra-xtreme
+const ESPORTS_SLUG_PREFIXES = ['cs2-', 'csgo-', 'lol-', 'dota2-', 'dota-', 'val-', 'valorant-', 'ow-', 'r6-', 'rl-'];
+
+function titleStartsWithGame(title: string): boolean {
+  return ESPORTS_GAMES.some((g) => {
+    if (!title.startsWith(g)) return false;
+    const next = title.charAt(g.length);
+    return next === '' || next === ':' || next === ' ' || next === '-';
+  });
+}
+
+// 判断是不是电竞对战类市场（这类基本用不上，打个标签方便快速跳过）
+function isEsportsGroup(g: MarketGroup): boolean {
+  const title = (g.title || '').toLowerCase().trim();
+  if (titleStartsWithGame(title)) return true;
+  // 结构特征：含 "vs" 且带 "(BOn)" 几乎都是电竞对战
+  if (/\bvs\.?\b/.test(title) && /\(\s*bo\s*\d+\s*\)/.test(title)) return true;
+  const blob = [g.slug, g.markets[0]?.categorySlug, g.markets[0]?.category, g.markets[0]?.slug]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  if (ESPORTS_SLUG_PREFIXES.some((p) => blob.includes(p))) return true;
+  if (/\besports?\b/.test(blob)) return true;
+  return false;
+}
+
 export function buildMessage(g: MarketGroup, idx: number, total: number, mode: SubMode): string {
   const lines: string[] = [];
   const tag = mode === 'all' && groupHasPolymarket(g) ? '（含 Polymarket 对应）' : '';
+  const kind = isEsportsGroup(g) ? '🎮 [电竞] ' : '';
   const scope = mode === 'all' ? '新市场' : 'Predict 独有市场';
   lines.push(`🆕 发现${scope} (${idx}/${total})`);
   lines.push('');
-  lines.push(`📊 ${g.title}${tag}`);
+  lines.push(`📊 ${kind}${g.title}${tag}`);
   const remain = fmtRemaining(g.endMs);
   lines.push(`总 PP/h: ${fmt(g.totalHourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}`);
   if (g.markets.length > 1) {
