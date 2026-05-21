@@ -6,7 +6,14 @@ import {
   predictMarketUrl
 } from './predict-markets';
 import { getCacheStatus, getMarketsCachedOrFetch, refreshMarketsCache } from './predict-cache';
-import { addSubscriber, getSubscriptions, isSubscribed, removeSubscriber, getSubscribersFilePath } from './subscribers';
+import {
+  addSubscriber,
+  getSubscriptions,
+  isSubscribed,
+  removeAllModes,
+  getSubscribersFilePath,
+  type SubMode
+} from './subscribers';
 import { getWatcherStatus, registerAlertSendFn } from './new-markets-alerts';
 import { runMonitorCycle } from './monitor';
 import { loadPairs } from './pairs';
@@ -150,9 +157,10 @@ const MENU_KEYBOARD = {
   inline_keyboard: [
     [{ text: '📊 Predict 独有市场（在派 PP）', callback_data: 'predict_only_all' }],
     [
-      { text: '🔔 订阅新市场提醒', callback_data: 'subscribe' },
-      { text: '🔕 取消订阅', callback_data: 'unsubscribe' }
+      { text: '🔔 订阅·Predict独有', callback_data: 'subscribe_predict_only' },
+      { text: '🔔 订阅·全部(含Poly)', callback_data: 'subscribe_all' }
     ],
+    [{ text: '🔕 取消本话题订阅', callback_data: 'unsubscribe' }],
     [{ text: '🔄 强制刷新缓存', callback_data: 'refresh_cache' }],
     [{ text: '🚨 立即跑一次价差检查', callback_data: 'check_spreads' }],
     [{ text: 'ℹ️ 监控状态', callback_data: 'status' }, { text: '❓ 帮助', callback_data: 'help' }]
@@ -164,25 +172,36 @@ async function handleRefreshCache(chatId: number | string, threadId: number | nu
   refreshMarketsCache().catch(() => {});
 }
 
-async function handleSubscribe(chatId: number | string, threadId: number | null, chatType: string) {
-  const added = addSubscriber(chatId, threadId);
+function modeLabel(mode: SubMode): string {
+  return mode === 'all' ? '全部(含Poly)' : 'Predict独有';
+}
+
+async function handleSubscribe(chatId: number | string, threadId: number | null, chatType: string, mode: SubMode) {
+  const added = addSubscriber(chatId, threadId, mode);
   const loc = threadId ? `\n话题 thread_id: ${threadId}` : '';
+  const scope = mode === 'all' ? '所有新市场（含 polymarket 也有的）' : '新的 Predict 独有市场';
+  const extra =
+    mode === 'all'
+      ? '\n\n注意：「全部」已包含 Predict 独有，无需再订阅 Predict独有 模式（否则同一市场会收到两条）。'
+      : '';
   await reply(
     chatId,
     threadId,
     added
-      ? `✅ 已订阅新市场提醒\n\nchat id: ${chatId}（${chatType}）${loc}\n\n当 predict.fun 出现新的「未结束 + 在派 PP」独有市场，会自动推送到${threadId ? '这个话题' : '这里'}。\n用 /unsubscribe 取消。`
-      : `这个${threadId ? '话题' : 'chat'}已经订阅了。\nchat id: ${chatId}${loc}`
+      ? `✅ 已订阅【${modeLabel(mode)}】新市场提醒\n\nchat id: ${chatId}（${chatType}）${loc}\n\n当出现${scope}（未结束 + 在派 PP），会自动推送到${threadId ? '这个话题' : '这里'}。\n用 /unsubscribe 取消本话题全部订阅。${extra}`
+      : `这个${threadId ? '话题' : 'chat'}已经订阅【${modeLabel(mode)}】了。\nchat id: ${chatId}${loc}`
   );
 }
 
 async function handleUnsubscribe(chatId: number | string, threadId: number | null) {
-  const removed = removeSubscriber(chatId, threadId);
+  const removed = removeAllModes(chatId, threadId);
   const loc = threadId ? `\nthread_id: ${threadId}` : '';
   await reply(
     chatId,
     threadId,
-    removed ? `🔕 已取消订阅。\nchat id: ${chatId}${loc}` : `这个${threadId ? '话题' : 'chat'}没在订阅列表里。\nchat id: ${chatId}${loc}`
+    removed
+      ? `🔕 已取消本话题的全部订阅（${removed} 个模式）。\nchat id: ${chatId}${loc}`
+      : `这个${threadId ? '话题' : 'chat'}没在订阅列表里。\nchat id: ${chatId}${loc}`
   );
 }
 
@@ -194,7 +213,7 @@ async function handleSubscribers(chatId: number | string, threadId: number | nul
     ...subs.map((s, i) => {
       const here = String(s.chatId) === String(chatId) && (s.threadId ?? null) === (threadId ?? null);
       const t = s.threadId ? ` (话题 ${s.threadId})` : '';
-      return `${i + 1}. ${s.chatId}${t}${here ? ' ← 当前' : ''}`;
+      return `${i + 1}. ${s.chatId}${t} [${modeLabel(s.mode)}]${here ? ' ← 当前' : ''}`;
     })
   ];
   if (filePath) lines.push('', `持久化文件: ${filePath}`);
@@ -203,10 +222,12 @@ async function handleSubscribers(chatId: number | string, threadId: number | nul
 }
 
 async function handleId(chatId: number | string, threadId: number | null, chatType: string) {
+  const subPO = isSubscribed(chatId, threadId, 'predict_only');
+  const subAll = isSubscribed(chatId, threadId, 'all');
   await reply(
     chatId,
     threadId,
-    `chat id: ${chatId}\ntype: ${chatType}\nthread_id: ${threadId ?? '(无/General)'}\n已订阅: ${isSubscribed(chatId, threadId) ? '是' : '否'}\n---\n实例: ${INSTANCE_ID}\n启动: ${INSTANCE_STARTED}\n版本: ${CODE_VERSION}`
+    `chat id: ${chatId}\ntype: ${chatType}\nthread_id: ${threadId ?? '(无/General)'}\n订阅·Predict独有: ${subPO ? '是' : '否'}\n订阅·全部: ${subAll ? '是' : '否'}\n---\n实例: ${INSTANCE_ID}\n启动: ${INSTANCE_STARTED}\n版本: ${CODE_VERSION}`
   );
 }
 
@@ -380,11 +401,10 @@ async function handleStatus(chatId: number | string, threadId: number | null) {
   if (cache.lastError) lines.push(`缓存错误: ${cache.lastError}`);
   lines.push('');
   lines.push(`🔔 新市场提醒`);
-  lines.push(`监视器: ${watcher.initialized ? '✅ 已初始化' : '⏳ 未初始化'}`);
-  lines.push(`已知 event: ${watcher.knownEvents}`);
-  lines.push(`订阅者: ${subs.length}`);
+  lines.push(`订阅总数: ${subs.length}（Predict独有 ${subs.filter((s) => s.mode === 'predict_only').length} / 全部 ${subs.filter((s) => s.mode === 'all').length}）`);
   lines.push(`噪音过滤词: ${getActiveExcludeKeywords().join(', ') || '(已关闭)'}`);
-  if (watcher.lastNewAt) lines.push(`上次新发现: ${watcher.lastNewAt}（${watcher.lastNewCount} 个）`);
+  lines.push(`· Predict独有: ${watcher.predictOnly.initialized ? '✅' : '⏳'} 已知 ${watcher.predictOnly.knownEvents}${watcher.predictOnly.lastNewAt ? `，上次新发现 ${watcher.predictOnly.lastNewAt}（${watcher.predictOnly.lastNewCount}）` : ''}`);
+  lines.push(`· 全部: ${watcher.all.initialized ? '✅' : '⏳'} 已知 ${watcher.all.knownEvents}${watcher.all.lastNewAt ? `，上次新发现 ${watcher.all.lastNewAt}（${watcher.all.lastNewCount}）` : ''}`);
   if (globalThis.__tgBotLastError) lines.push(`Bot 错误: ${globalThis.__tgBotLastError}`);
   await reply(chatId, threadId, lines.join('\n'));
 }
@@ -396,8 +416,9 @@ async function handleHelp(chatId: number | string, threadId: number | null) {
     '/menu - 显示主菜单（按钮）',
     '/predict_only - Predict 独有市场（默认只看在派 PP 的，按 event 分组）',
     '/predict_only all - 包含 PP=0 的市场',
-    '/subscribe - 订阅新市场提醒（个人/群组/话题都可以）',
-    '/unsubscribe - 取消订阅',
+    '/subscribe - 订阅 Predict 独有的新市场提醒',
+    '/subscribe_all - 订阅全部新市场提醒（含 polymarket 也有的）',
+    '/unsubscribe - 取消本话题全部订阅',
     '/subscribers - 查看订阅列表',
     '/id - 查看当前 chat id 和 thread_id',
     '/check - 立即跑一次价差检查',
@@ -423,9 +444,14 @@ async function handleCommand(
       await sendMenu(chatId, threadId, '👋 欢迎使用 Predict-Poly 监控机器人。\n\n');
       return;
     case '/subscribe':
-      await handleSubscribe(chatId, threadId, chatType);
+      await handleSubscribe(chatId, threadId, chatType, 'predict_only');
+      return;
+    case '/subscribe_all':
+    case '/subscribeall':
+      await handleSubscribe(chatId, threadId, chatType, 'all');
       return;
     case '/unsubscribe':
+    case '/unsubscribe_all':
       await handleUnsubscribe(chatId, threadId);
       return;
     case '/subscribers':
@@ -476,7 +502,11 @@ async function handleCallback(query: TgCallbackQuery) {
       await handlePredictOnly(chatId, threadId, true);
       break;
     case 'subscribe':
-      await handleSubscribe(chatId, threadId, chatType);
+    case 'subscribe_predict_only':
+      await handleSubscribe(chatId, threadId, chatType, 'predict_only');
+      break;
+    case 'subscribe_all':
+      await handleSubscribe(chatId, threadId, chatType, 'all');
       break;
     case 'unsubscribe':
       await handleUnsubscribe(chatId, threadId);
@@ -499,7 +529,15 @@ async function handleCallback(query: TgCallbackQuery) {
 }
 
 // 这些命令无需 isAllowed 鉴权（用户/群组/话题首次接入需要用）
-const UNAUTHED_COMMANDS = new Set(['/start', '/id', '/subscribe', '/unsubscribe']);
+const UNAUTHED_COMMANDS = new Set([
+  '/start',
+  '/id',
+  '/subscribe',
+  '/subscribe_all',
+  '/subscribeall',
+  '/unsubscribe',
+  '/unsubscribe_all'
+]);
 
 async function handleUpdate(update: TgUpdate) {
   if (update.callback_query) {
@@ -537,8 +575,9 @@ async function registerCommandsMenu() {
       commands: [
         { command: 'menu', description: '主菜单' },
         { command: 'predict_only', description: 'Predict 独有市场（在派 PP）' },
-        { command: 'subscribe', description: '订阅新市场提醒' },
-        { command: 'unsubscribe', description: '取消订阅' },
+        { command: 'subscribe', description: '订阅 Predict 独有新市场' },
+        { command: 'subscribe_all', description: '订阅全部新市场(含Poly)' },
+        { command: 'unsubscribe', description: '取消本话题订阅' },
         { command: 'subscribers', description: '查看订阅列表' },
         { command: 'id', description: '查看当前 chat id' },
         { command: 'refresh', description: '强制刷新缓存' },

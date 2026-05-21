@@ -1,17 +1,42 @@
 import { filterOutNoise, filterPredictOnly, groupMarketsByCategory, type MarketGroup } from './predict-markets';
-import { getSubscriptions } from './subscribers';
+import { getSubscriptions, type SubMode } from './subscribers';
 import type { MarketsCacheEntry } from './predict-cache';
 
 declare global {
-  var __seenEventSlugs: Set<string> | undefined;
-  var __watcherInitialized: boolean | undefined;
-  var __lastNewMarketsAt: string | undefined;
-  var __lastNewMarketsCount: number | undefined;
+  var __seenSlugsPredictOnly: Set<string> | undefined;
+  var __seenSlugsAll: Set<string> | undefined;
+  var __watcherInitPredictOnly: boolean | undefined;
+  var __watcherInitAll: boolean | undefined;
+  var __lastNewAtPredictOnly: string | undefined;
+  var __lastNewAtAll: string | undefined;
+  var __lastNewCountPredictOnly: number | undefined;
+  var __lastNewCountAll: number | undefined;
 }
 
-function getSeen(): Set<string> {
-  if (!globalThis.__seenEventSlugs) globalThis.__seenEventSlugs = new Set<string>();
-  return globalThis.__seenEventSlugs;
+function getSeen(mode: SubMode): Set<string> {
+  if (mode === 'all') {
+    if (!globalThis.__seenSlugsAll) globalThis.__seenSlugsAll = new Set<string>();
+    return globalThis.__seenSlugsAll;
+  }
+  if (!globalThis.__seenSlugsPredictOnly) globalThis.__seenSlugsPredictOnly = new Set<string>();
+  return globalThis.__seenSlugsPredictOnly;
+}
+
+function getInit(mode: SubMode): boolean {
+  return mode === 'all' ? !!globalThis.__watcherInitAll : !!globalThis.__watcherInitPredictOnly;
+}
+function setInit(mode: SubMode) {
+  if (mode === 'all') globalThis.__watcherInitAll = true;
+  else globalThis.__watcherInitPredictOnly = true;
+}
+function setLastNew(mode: SubMode, count: number) {
+  if (mode === 'all') {
+    globalThis.__lastNewAtAll = new Date().toISOString();
+    globalThis.__lastNewCountAll = count;
+  } else {
+    globalThis.__lastNewAtPredictOnly = new Date().toISOString();
+    globalThis.__lastNewCountPredictOnly = count;
+  }
 }
 
 function fmt(value: unknown, digits = 1): string {
@@ -29,11 +54,17 @@ function fmtRemaining(endMs?: number | null): string {
   return `${Math.round(ms / 60000)}m`;
 }
 
-function buildMessage(g: MarketGroup, idx: number, total: number): string {
+function groupHasPolymarket(g: MarketGroup): boolean {
+  return g.markets.some((m) => m.hasPolymarket);
+}
+
+export function buildMessage(g: MarketGroup, idx: number, total: number, mode: SubMode): string {
   const lines: string[] = [];
-  lines.push(`🆕 发现新的 Predict 独有市场 (${idx}/${total})`);
+  const tag = mode === 'all' && groupHasPolymarket(g) ? '（含 Polymarket 对应）' : '';
+  const scope = mode === 'all' ? '新市场' : 'Predict 独有市场';
+  lines.push(`🆕 发现${scope} (${idx}/${total})`);
   lines.push('');
-  lines.push(`📊 ${g.title}`);
+  lines.push(`📊 ${g.title}${tag}`);
   const remain = fmtRemaining(g.endMs);
   lines.push(`总 PP/h: ${fmt(g.totalHourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}`);
   if (g.markets.length > 1) {
@@ -58,28 +89,42 @@ export function registerAlertSendFn(fn: AlertSendFn) {
 }
 
 export type NewMarketsResult = {
+  mode: SubMode;
   totalEvents: number;
   newCount: number;
   notified: number;
   initial: boolean;
 };
 
-export async function notifyNewMarkets(entry: MarketsCacheEntry): Promise<NewMarketsResult> {
-  const allPredictOnly = filterPredictOnly(entry.markets);
-  const afterNoise = filterOutNoise(allPredictOnly);
-  const noiseRemoved = allPredictOnly.length - afterNoise.length;
-  const predictOnly = afterNoise.filter((m) => m.tradeable && m.hourlyRate > 0);
-  let groups = groupMarketsByCategory(predictOnly).filter((g) => g.totalHourlyRate > 0);
-  console.log(`[new-markets] predict-only=${allPredictOnly.length}, noise过滤=${noiseRemoved}, tradeable+PP=${predictOnly.length}, events=${groups.length}`);
+// 计算某 mode 下符合条件的 event 分组
+export function computeEligibleGroups(entry: MarketsCacheEntry, mode: SubMode): {
+  groups: MarketGroup[];
+  predictOnlyCount: number;
+  noiseRemoved: number;
+} {
+  // mode='all' 时不做 polymarket 过滤；'predict_only' 时只留无 poly 映射的
+  const base = mode === 'all' ? entry.markets : filterPredictOnly(entry.markets);
+  const afterNoise = filterOutNoise(base);
+  const noiseRemoved = base.length - afterNoise.length;
+  const eligible = afterNoise.filter((m) => m.tradeable && m.hourlyRate > 0);
+  const groups = groupMarketsByCategory(eligible)
+    .filter((g) => g.totalHourlyRate > 0)
+    .sort((a, b) => (b.totalHourlyRate || 0) - (a.totalHourlyRate || 0));
+  return { groups, predictOnlyCount: base.length, noiseRemoved };
+}
 
-  const seen = getSeen();
+async function notifyForMode(entry: MarketsCacheEntry, mode: SubMode): Promise<NewMarketsResult> {
+  const { groups, predictOnlyCount, noiseRemoved } = computeEligibleGroups(entry, mode);
+  console.log(`[new-markets][${mode}] base=${predictOnlyCount}, noise过滤=${noiseRemoved}, events=${groups.length}`);
 
-  // 首次扫描：标记全部为已知，不发提醒
-  if (!globalThis.__watcherInitialized) {
+  const seen = getSeen(mode);
+
+  // 首次扫描：标记全部为已知，不报警
+  if (!getInit(mode)) {
     for (const g of groups) seen.add(g.slug);
-    globalThis.__watcherInitialized = true;
-    console.log(`[new-markets] initial scan: ${seen.size} events seeded, no alerts`);
-    return { totalEvents: groups.length, newCount: 0, notified: 0, initial: true };
+    setInit(mode);
+    console.log(`[new-markets][${mode}] initial scan: ${seen.size} events seeded, no alerts`);
+    return { mode, totalEvents: groups.length, newCount: 0, notified: 0, initial: true };
   }
 
   const newGroups: MarketGroup[] = [];
@@ -89,48 +134,55 @@ export async function notifyNewMarkets(entry: MarketsCacheEntry): Promise<NewMar
       seen.add(g.slug);
     }
   }
-
   if (!newGroups.length) {
-    return { totalEvents: groups.length, newCount: 0, notified: 0, initial: false };
+    return { mode, totalEvents: groups.length, newCount: 0, notified: 0, initial: false };
   }
 
-  newGroups.sort((a, b) => (b.totalHourlyRate || 0) - (a.totalHourlyRate || 0));
-  globalThis.__lastNewMarketsAt = new Date().toISOString();
-  globalThis.__lastNewMarketsCount = newGroups.length;
+  setLastNew(mode, newGroups.length);
 
-  if (!registeredSendFn) {
-    console.warn(`[new-markets] ${newGroups.length} new events but no send fn registered`);
-    return { totalEvents: groups.length, newCount: newGroups.length, notified: 0, initial: false };
+  const subs = getSubscriptions(mode);
+  if (!registeredSendFn || !subs.length) {
+    console.log(`[new-markets][${mode}] ${newGroups.length} new events, subscribers=${subs.length}, sendFn=${!!registeredSendFn}`);
+    return { mode, totalEvents: groups.length, newCount: newGroups.length, notified: 0, initial: false };
   }
 
-  const subs = getSubscriptions();
-  if (!subs.length) {
-    console.log(`[new-markets] ${newGroups.length} new events, but no subscribers`);
-    return { totalEvents: groups.length, newCount: newGroups.length, notified: 0, initial: false };
-  }
-
-  console.log(`[new-markets] ${newGroups.length} new events → ${subs.length} subscriptions`);
+  console.log(`[new-markets][${mode}] ${newGroups.length} new events → ${subs.length} subscriptions`);
   let notified = 0;
   for (let i = 0; i < newGroups.length; i++) {
-    const text = buildMessage(newGroups[i], i + 1, newGroups.length);
+    const text = buildMessage(newGroups[i], i + 1, newGroups.length, mode);
     for (const sub of subs) {
       try {
         await registeredSendFn(sub.chatId, text, sub.threadId);
         notified += 1;
         await new Promise((r) => setTimeout(r, 1200));
       } catch (err) {
-        console.error(`[new-markets] send to ${sub.chatId}:${sub.threadId} failed:`, err instanceof Error ? err.message : err);
+        console.error(`[new-markets][${mode}] send to ${sub.chatId}:${sub.threadId} failed:`, err instanceof Error ? err.message : err);
       }
     }
   }
-  return { totalEvents: groups.length, newCount: newGroups.length, notified, initial: false };
+  return { mode, totalEvents: groups.length, newCount: newGroups.length, notified, initial: false };
+}
+
+// refresh hook 入口：两种 mode 都跑
+export async function notifyNewMarkets(entry: MarketsCacheEntry): Promise<NewMarketsResult[]> {
+  const predictOnly = await notifyForMode(entry, 'predict_only');
+  const all = await notifyForMode(entry, 'all');
+  return [predictOnly, all];
 }
 
 export function getWatcherStatus() {
   return {
-    initialized: !!globalThis.__watcherInitialized,
-    knownEvents: globalThis.__seenEventSlugs?.size ?? 0,
-    lastNewAt: globalThis.__lastNewMarketsAt ?? null,
-    lastNewCount: globalThis.__lastNewMarketsCount ?? 0
+    predictOnly: {
+      initialized: !!globalThis.__watcherInitPredictOnly,
+      knownEvents: globalThis.__seenSlugsPredictOnly?.size ?? 0,
+      lastNewAt: globalThis.__lastNewAtPredictOnly ?? null,
+      lastNewCount: globalThis.__lastNewCountPredictOnly ?? 0
+    },
+    all: {
+      initialized: !!globalThis.__watcherInitAll,
+      knownEvents: globalThis.__seenSlugsAll?.size ?? 0,
+      lastNewAt: globalThis.__lastNewAtAll ?? null,
+      lastNewCount: globalThis.__lastNewCountAll ?? 0
+    }
   };
 }
