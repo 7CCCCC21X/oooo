@@ -70,6 +70,19 @@ const ESPORTS_GAMES = [
 // slug 前缀，如 cs2-mglz-tl1 / lol-dnf-drx / dota2-tundra-xtreme
 const ESPORTS_SLUG_PREFIXES = ['cs2-', 'csgo-', 'lol-', 'dota2-', 'dota-', 'val-', 'valorant-', 'ow-', 'r6-', 'rl-'];
 
+// 传统体育：slug 前缀（如 mlb-hou-chc / cricipl-sun-roy）和联赛关键词
+const SPORTS_SLUG_PREFIXES = [
+  'mlb-', 'nba-', 'wnba-', 'nfl-', 'nhl-', 'mls-', 'ncaa-', 'ncaab-', 'ncaaf-',
+  'epl-', 'laliga-', 'seriea-', 'bundesliga-', 'ligue1-', 'ucl-', 'uel-', 'uefa-',
+  'cric-', 'cricipl-', 'ipl-', 'bbl-', 'atp-', 'wta-', 'tennis-', 'ufc-', 'mma-',
+  'nascar-', 'nrl-', 'afl-', 'khl-', 'rugby-', 'soccer-', 'football-'
+];
+const SPORTS_LEAGUE_KEYWORDS = [
+  'premier league', 'la liga', 'serie a', 'bundesliga', 'ligue 1', 'eredivisie',
+  'champions league', 'europa league', 'uefa', 'world cup', 'copa', 'fa cup',
+  'indian premier league', 'big bash', 'major league baseball', 'formula 1', 'grand prix'
+];
+
 function titleStartsWithGame(title: string): boolean {
   return ESPORTS_GAMES.some((g) => {
     if (!title.startsWith(g)) return false;
@@ -78,25 +91,52 @@ function titleStartsWithGame(title: string): boolean {
   });
 }
 
+function groupBlob(g: MarketGroup): string {
+  return [g.title, g.slug, g.markets[0]?.categorySlug, g.markets[0]?.category, g.markets[0]?.slug]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+}
+
+// "A vs B" / "A vs. B" / "A versus B" 对战结构
+function hasVsMatchup(title: string): boolean {
+  return /\bvs\.?\b/.test(title) || /\bversus\b/.test(title);
+}
+
 // 判断是不是电竞对战类市场（这类基本用不上，打个标签方便快速跳过）
 function isEsportsGroup(g: MarketGroup): boolean {
   const title = (g.title || '').toLowerCase().trim();
   if (titleStartsWithGame(title)) return true;
   // 结构特征：含 "vs" 且带 "(BOn)" 几乎都是电竞对战
-  if (/\bvs\.?\b/.test(title) && /\(\s*bo\s*\d+\s*\)/.test(title)) return true;
-  const blob = [g.slug, g.markets[0]?.categorySlug, g.markets[0]?.category, g.markets[0]?.slug]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase();
+  if (hasVsMatchup(title) && /\(\s*bo\s*\d+\s*\)/.test(title)) return true;
+  const blob = groupBlob(g);
   if (ESPORTS_SLUG_PREFIXES.some((p) => blob.includes(p))) return true;
   if (/\besports?\b/.test(blob)) return true;
   return false;
 }
 
+// 传统体育对战（板球/足球/棒球等），同样基本用不上
+function isSportsGroup(g: MarketGroup): boolean {
+  const title = (g.title || '').toLowerCase().trim();
+  const blob = groupBlob(g);
+  if (SPORTS_SLUG_PREFIXES.some((p) => blob.includes(p))) return true;
+  if (SPORTS_LEAGUE_KEYWORDS.some((k) => blob.includes(k))) return true;
+  // 电竞已先行判定，剩下的 "A vs B" 对战基本是体育赛事
+  if (hasVsMatchup(title)) return true;
+  return false;
+}
+
+// 给对战类市场分类打标签：电竞优先，其次传统体育
+function groupTag(g: MarketGroup): string {
+  if (isEsportsGroup(g)) return '🎮 [电竞] ';
+  if (isSportsGroup(g)) return '🏆 [体育] ';
+  return '';
+}
+
 export function buildMessage(g: MarketGroup, idx: number, total: number, mode: SubMode): string {
   const lines: string[] = [];
   const tag = mode === 'all' && groupHasPolymarket(g) ? '（含 Polymarket 对应）' : '';
-  const kind = isEsportsGroup(g) ? '🎮 [电竞] ' : '';
+  const kind = groupTag(g);
   const scope = mode === 'all' ? '新市场' : 'Predict 独有市场';
   lines.push(`🆕 发现${scope} (${idx}/${total})`);
   lines.push('');
