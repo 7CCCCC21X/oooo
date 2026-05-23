@@ -1,6 +1,7 @@
 import { envNumber } from './env';
 import { loadPairs } from './pairs';
 import { checkPairs } from './spread';
+import { getPairLinks, type PairLinks } from './market-links';
 import type { SpreadResult } from './types';
 
 type AlertCache = Map<string, number>;
@@ -49,17 +50,39 @@ function filterCooldown(alerts: SpreadResult[]): SpreadResult[] {
   return kept;
 }
 
-function formatAlertMessage(alerts: SpreadResult[]): string {
+const MAX_ALERT_ITEMS = 20;
+
+// 给每条 alert 解析两边市场的标题+链接（失败不致命，价格信息照常发）
+async function enrichAlerts(alerts: SpreadResult[]): Promise<PairLinks[]> {
+  const top = alerts.slice(0, MAX_ALERT_ITEMS);
+  return Promise.all(
+    top.map((item) =>
+      getPairLinks(item.pair).catch(() => ({ predict: { title: '', url: '' }, poly: { title: '', url: '' } }))
+    )
+  );
+}
+
+function formatAlertMessage(alerts: SpreadResult[], links: PairLinks[] = []): string {
   const header = `🚨 Predict.fun × Polymarket 价差提醒\n触发数量：${alerts.length}`;
-  const body = alerts.slice(0, 20).map((item, index) => {
-    return [
-      `${index + 1}. ${item.pair.name}`,
+  const body = alerts.slice(0, MAX_ALERT_ITEMS).map((item, index) => {
+    const link = links[index];
+    const lines = [`${index + 1}. ${item.pair.name}`];
+    if (link?.predict && (link.predict.title || link.predict.url)) {
+      lines.push(`🔵 Predict.fun: ${link.predict.title || item.pair.predictMarketId}`);
+      if (link.predict.url) lines.push(link.predict.url);
+    }
+    if (link?.poly && (link.poly.title || link.poly.url)) {
+      lines.push(`🟣 Polymarket: ${link.poly.title || item.pair.polymarketOutcome || '-'}`);
+      if (link.poly.url) lines.push(link.poly.url);
+    }
+    lines.push(
       `Predict side: ${item.pair.predictSide || 'Yes'}`,
       `Polymarket outcome: ${item.pair.polymarketOutcome || '-'}`,
       `方向: ${item.directionLabel || '-'}`,
       `价差: ${fmt(item.gap)} = ${fmt(item.gapCents, 2)}¢，阈值: ${fmt(item.threshold)}`,
       `买价: ${fmt(item.buyPrice)}，卖价: ${fmt(item.sellPrice)}，可比数量: ${fmt(item.comparableSize, 2)}`
-    ].join('\n');
+    );
+    return lines.join('\n');
   });
   return [header, ...body].join('\n\n').slice(0, 3900);
 }
@@ -113,7 +136,8 @@ export async function runMonitorCycle(): Promise<MonitorCycleResult> {
   let telegramError = '';
   if (alerts.length) {
     try {
-      telegramSent = await sendTelegram(formatAlertMessage(alerts));
+      const links = await enrichAlerts(alerts);
+      telegramSent = await sendTelegram(formatAlertMessage(alerts, links));
     } catch (error) {
       telegramError = error instanceof Error ? error.message : String(error);
     }
