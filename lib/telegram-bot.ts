@@ -17,6 +17,7 @@ import {
 import { getWatcherStatus, registerAlertSendFn } from './new-markets-alerts';
 import { runMonitorCycle } from './monitor';
 import { loadPairs } from './pairs';
+import { getSpreadAlertsStatus, setSpreadAlertsEnabled } from './alert-state';
 import { CODE_VERSION } from './version';
 
 declare global {
@@ -357,7 +358,7 @@ async function handleCheckSpreads(chatId: number | string, threadId: number | nu
       `配置对数: ${result.pairCount}`,
       `原始触发: ${result.rawAlertCount}`,
       `本轮发送: ${result.alertCount}（cooldown 内的会跳过）`,
-      `Telegram 推送: ${result.telegramSent ? '✅' : '⏭️'}${result.telegramError ? ` 错误: ${result.telegramError}` : ''}`
+      `Telegram 推送: ${result.alertsMuted ? '🔕 已关闭（/spread_on 开启）' : result.telegramSent ? '✅' : '⏭️'}${result.telegramError ? ` 错误: ${result.telegramError}` : ''}`
     ];
     if (!result.alertCount && result.results.length) {
       const best = [...result.results]
@@ -376,13 +377,36 @@ async function handleCheckSpreads(chatId: number | string, threadId: number | nu
   }
 }
 
+async function handleSpreadToggle(
+  chatId: number | string,
+  threadId: number | null,
+  enable: boolean
+) {
+  const r = setSpreadAlertsEnabled(enable, String(chatId));
+  if (!r.changed) {
+    await reply(chatId, threadId, enable ? '价差提醒已经是开启状态。' : '价差提醒已经是关闭状态。');
+    return;
+  }
+  if (enable) {
+    await reply(chatId, threadId, '✅ 价差提醒已开启。后台监控继续跑，触发会推送到 Telegram。');
+  } else {
+    await reply(
+      chatId,
+      threadId,
+      '🔕 价差提醒已关闭。后台监控仍在跑，但不会再推送 Telegram；用 /spread_on 重新开启，或 /check 手动查看当前价差。'
+    );
+  }
+}
+
 async function handleStatus(chatId: number | string, threadId: number | null) {
   const pairs = loadPairs();
   const cache = getCacheStatus();
   const watcher = getWatcherStatus();
   const subs = getSubscriptions();
+  const alertState = getSpreadAlertsStatus();
   const lines = [
     `🟢 监控状态`,
+    `价差提醒: ${alertState.enabled ? '✅ 开启' : '🔕 关闭'}${alertState.changedAt ? `（${alertState.changedAt} 改）` : ''}`,
     `进程内监控: ${globalThis.__spreadMonitorTimer ? '运行中' : '未启动'}`,
     `Bot 长轮询: ${globalThis.__tgBotPolling ? '运行中' : '未启动'}`,
     `配置对数: ${pairs.length}`,
@@ -422,6 +446,8 @@ async function handleHelp(chatId: number | string, threadId: number | null) {
     '/subscribers - 查看订阅列表',
     '/id - 查看当前 chat id 和 thread_id',
     '/check - 立即跑一次价差检查',
+    '/spread_off - 关闭价差提醒（监控继续跑但不推送）',
+    '/spread_on - 重新开启价差提醒',
     '/status - 监控运行状态',
     '/help - 显示这条帮助',
     '',
@@ -469,6 +495,16 @@ async function handleCommand(
     case '/check':
     case '/spreads':
       await handleCheckSpreads(chatId, threadId);
+      return;
+    case '/spread_off':
+    case '/spreadoff':
+    case '/alerts_off':
+      await handleSpreadToggle(chatId, threadId, false);
+      return;
+    case '/spread_on':
+    case '/spreadon':
+    case '/alerts_on':
+      await handleSpreadToggle(chatId, threadId, true);
       return;
     case '/refresh':
       await handleRefreshCache(chatId, threadId);

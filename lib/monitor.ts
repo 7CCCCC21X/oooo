@@ -2,6 +2,7 @@ import { envNumber } from './env';
 import { loadPairs } from './pairs';
 import { checkPairs } from './spread';
 import { getPairLinks, type PairLinks } from './market-links';
+import { isSpreadAlertsEnabled } from './alert-state';
 import type { SpreadResult } from './types';
 
 type AlertCache = Map<string, number>;
@@ -121,6 +122,7 @@ export type MonitorCycleResult = {
   pairCount: number;
   rawAlertCount: number;
   alertCount: number;
+  alertsMuted: boolean;
   telegramSent: boolean;
   telegramError: string;
   alerts: SpreadResult[];
@@ -134,7 +136,8 @@ export async function runMonitorCycle(): Promise<MonitorCycleResult> {
   const alerts = filterCooldown(rawAlerts);
   let telegramSent = false;
   let telegramError = '';
-  if (alerts.length) {
+  const alertsMuted = !isSpreadAlertsEnabled();
+  if (alerts.length && !alertsMuted) {
     try {
       const links = await enrichAlerts(alerts);
       telegramSent = await sendTelegram(formatAlertMessage(alerts, links));
@@ -147,6 +150,7 @@ export async function runMonitorCycle(): Promise<MonitorCycleResult> {
     pairCount: pairs.length,
     rawAlertCount: rawAlerts.length,
     alertCount: alerts.length,
+    alertsMuted,
     telegramSent,
     telegramError,
     alerts,
