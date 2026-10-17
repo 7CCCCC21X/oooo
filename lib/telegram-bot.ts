@@ -1,10 +1,4 @@
-import {
-  filterOutNoise,
-  filterPredictOnly,
-  getActiveExcludeKeywords,
-  groupMarketsByCategory,
-  predictMarketUrl
-} from './predict-markets';
+import { getActiveExcludeKeywords, predictMarketUrl, selectEligibleGroups } from './predict-markets';
 import { getCacheStatus, getMarketsCachedOrFetch, refreshMarketsCache } from './predict-cache';
 import {
   addSubscriber,
@@ -301,34 +295,34 @@ async function handlePredictOnly(chatId: number | string, threadId: number | nul
   }
   try {
     const entry = await getMarketsCachedOrFetch();
-    const { markets, pagesFetched, stoppedReason, totalCategories, totalUniqueMarketIds, fetchedAt, durationMs } = entry;
-    let predictOnly = filterOutNoise(filterPredictOnly(markets));
-    predictOnly = predictOnly.filter((m) => m.tradeable);
-    if (onlyRewards) {
-      predictOnly = predictOnly.filter((m) => m.hourlyRate > 0);
-    }
-    predictOnly.sort((a, b) => (b.hourlyRate || 0) - (a.hourlyRate || 0));
-    if (!predictOnly.length) {
-      const withPoly = markets.length - filterPredictOnly(markets).length;
+    const { markets, pagesFetched, stoppedReason, totalCategories, totalUniqueMarketIds, fetchedAt, complete, pageSize, statusFilter } = entry;
+    // 与订阅推送 / API 同一套筛选口径
+    const { groups, stats } = selectEligibleGroups(markets, { predictOnly: true, requireRewards: onlyRewards });
+    // 抓取没翻到底（页数上限 / 中途报错）时提醒，否则用户以为这就是全部
+    const crawlNote = complete
+      ? ''
+      : `\n⚠️ 抓取未翻到底（${pagesFetched} 页 × 每页约 ${pageSize || '?'} 个类目，stop=${stoppedReason}），列表可能不完整。可用 /refresh 重抓或调大 PREDICT_CACHE_MAX_PAGES`;
+    if (!groups.length) {
       await reply(
         chatId,
         threadId,
-        `没找到 predict 独有市场（在派 PP）。\nsource: /v1/categories (cached at ${fetchedAt})\n抓取: ${pagesFetched} 页 (stop=${stoppedReason})\n类目数: ${totalCategories}\n市场数: ${totalUniqueMarketIds}\n通过 tradeable+PP 过滤: ${predictOnly.length}\n其中 polymarket 映射: ${withPoly}`
+        [
+          `没找到 predict 独有市场${onlyRewards ? '（在派 PP）' : ''}。`,
+          `source: /v1/categories (cached at ${fetchedAt}, status=${statusFilter ?? 'none'})`,
+          `抓取: ${pagesFetched} 页 (stop=${stoppedReason}, 完整=${complete ? '是' : '否'})`,
+          `类目数: ${totalCategories} · 市场数: ${totalUniqueMarketIds}`,
+          `筛选漏斗: 全部 ${stats.input} → 去 polymarket ${stats.afterPolymarket} → 去噪音 ${stats.afterNoise} → 可交易 ${stats.afterTradeable} → 有 PP ${stats.afterRewards}`
+        ].join('\n') + crawlNote
       );
       return;
     }
-    void durationMs;
-    void fetchedAt;
-    const totalFound = predictOnly.length;
-    let groups = groupMarketsByCategory(predictOnly);
-    groups = groups.filter((g) => g.totalHourlyRate > 0);
-    groups.sort((a, b) => (b.totalHourlyRate || 0) - (a.totalHourlyRate || 0));
-    if (!groups.length) {
-      await reply(chatId, threadId, `没找到正在派 PP 的 predict 独有 event。`);
-      return;
-    }
+    const totalFound = stats.output;
     const totalPP = groups.reduce((s, g) => s + g.totalHourlyRate, 0);
-    const header = `📊 Predict 独有市场（在派 PP）\n共 ${groups.length} 个 event / ${totalFound} 个市场\n总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）\n`;
+    const header =
+      `📊 Predict 独有市场${onlyRewards ? '（在派 PP）' : '（全部）'}\n共 ${groups.length} 个 event / ${totalFound} 个市场\n` +
+      `总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）\n` +
+      `筛选: 全部 ${stats.input} → 独有 ${stats.afterPolymarket} → 去噪音 ${stats.afterNoise} → 可交易 ${stats.afterTradeable} → 有 PP ${stats.afterRewards}` +
+      crawlNote + '\n';
 
     // 选项全部列出，不再截断；超长由 sendInChunks 按行拆成多条消息
     const items = groups.map((g, i) => {
@@ -446,7 +440,8 @@ async function handleStatus(chatId: number | string, threadId: number | null) {
     `状态: ${cache.hasCache ? '✅ 已缓存' : '⏳ 未缓存'}${cache.refreshInflight ? '（刷新中）' : ''}`,
     `市场数: ${cache.totalMarkets}`,
     `类目数: ${cache.totalCategories}`,
-    `抓取: ${cache.pagesFetched} 页, ${cache.durationMs}ms, stop=${cache.stoppedReason}`,
+    `抓取: ${cache.pagesFetched} 页（每页约 ${cache.pageSize || '?'}）, ${cache.durationMs}ms, stop=${cache.stoppedReason}`,
+    `完整性: ${cache.complete == null ? '-' : cache.complete ? '✅ 翻到底' : '⚠️ 未翻到底（页数上限或中途报错）'} · 服务端过滤 status=${cache.statusFilter ?? 'none'}`,
     `更新于: ${cache.fetchedAt || '(尚未)'}（${cache.ageMs == null ? '-' : Math.round(cache.ageMs / 1000) + 's 前'}）`
   ];
   if (cache.lastError) lines.push(`缓存错误: ${cache.lastError}`);

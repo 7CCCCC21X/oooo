@@ -13,7 +13,18 @@
 - `POST /api/spreads` — body `{ pairs: [...] }` 用临时配置查价差
 - `POST /api/resolve` — body `{ predictMarketId }` 自动生成 pairs
 - `GET /api/cron?secret=...` — 手动触发一次监控周期
-- `GET /api/predict-only?hasActiveRewards=1&minHourlyRate=N&debug=1` — predict 独有市场
+- `GET /api/predict-only?hasActiveRewards=1&minHourlyRate=N&debug=1` — predict 独有市场（响应里 `complete` 表示抓取是否翻到底，`filterStats` 是筛选漏斗各步计数）
+
+## 市场抓取与筛选
+
+数据来自 `/v1/categories`（市场嵌在 category 里），抓取规则：
+
+- 默认带 `status=OPEN` 让服务端过滤掉已结算类目（`PREDICT_CATEGORY_STATUS`，设 `none` 全量抓）；接口拒绝该参数或返回空时自动退回全量。
+- 单页 429/5xx/超时 会指数退避重试（`PREDICT_FETCH_RETRIES`，默认 4 次），不再一次失败就截断整个列表。
+- 翻页到 `PREDICT_CACHE_MAX_PAGES`（默认 500）或中途报错时标记为「不完整」，bot 列表头部和 `/status` 会提示；不完整且比上一份缓存少很多时不覆盖旧缓存。
+
+筛选口径（bot `/predict_only`、订阅推送、`/api/predict-only` 共用 `selectEligibleMarkets`）：
+`polymarketConditionIds` 为空 → 去噪音关键词 → 可交易（市场/交易状态未关闭、所属类目未 RESOLVED、未到期、`closed`/`active` 标记）→ PP/h > 0。
 - `GET /api/health` — 健康检查 + 监控状态
 
 ## 后台监控

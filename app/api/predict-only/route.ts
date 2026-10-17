@@ -1,10 +1,5 @@
 import { NextResponse } from 'next/server';
-import {
-  fetchAllPredictMarkets,
-  fetchAllPredictMarketsViaCategories,
-  filterOutNoise,
-  filterPredictOnly
-} from '@/lib/predict-markets';
+import { fetchAllPredictMarkets, fetchAllPredictMarketsViaCategories, selectEligibleMarkets } from '@/lib/predict-markets';
 import { getCachedMarkets, getCacheStatus, refreshMarketsCache, getMarketsCachedOrFetch } from '@/lib/predict-cache';
 
 export const dynamic = 'force-dynamic';
@@ -28,6 +23,7 @@ export async function GET(request: Request) {
     let totalCategories: number | undefined;
     let totalUniqueMarketIds: number | undefined;
     let categoriesWithoutMarkets: number | undefined;
+    let complete: boolean | undefined;
     let sampleRaw: unknown;
     let rawWrapperKeys: string[] | undefined;
     let paginationMode: string | undefined;
@@ -63,6 +59,7 @@ export async function GET(request: Request) {
       totalCategories = r.totalCategories;
       totalUniqueMarketIds = r.totalUniqueMarketIds;
       categoriesWithoutMarkets = r.categoriesWithoutMarkets;
+      complete = r.complete;
       paginationMode = 'categories-cursor-live';
       totalUniqueIds = r.totalUniqueMarketIds;
       usedSource = 'categories-live';
@@ -74,6 +71,7 @@ export async function GET(request: Request) {
       stoppedReason = entry.stoppedReason;
       totalCategories = entry.totalCategories;
       totalUniqueMarketIds = entry.totalUniqueMarketIds;
+      complete = entry.complete;
       paginationMode = 'categories-cursor-cached';
       totalUniqueIds = entry.totalUniqueMarketIds;
       usedSource = 'cache';
@@ -81,14 +79,15 @@ export async function GET(request: Request) {
     }
 
     const includeNoise = url.searchParams.get('includeNoise') === '1';
-    let predictOnly = filterPredictOnly(markets);
-    if (!includeNoise) predictOnly = filterOutNoise(predictOnly);
-    if (hasActiveRewards) {
-      predictOnly = predictOnly.filter((m) => m.hourlyRate > 0);
-    }
-    if (Number.isFinite(minHourlyRate) && minHourlyRate > 0) {
-      predictOnly = predictOnly.filter((m) => m.hourlyRate >= minHourlyRate);
-    }
+    // 与 bot / 订阅推送同一套筛选口径。这里默认不按可交易过滤（网页端自己筛），
+    // includeClosed=0 时才在服务端去掉不可交易的。
+    const { markets: predictOnly, stats: filterStats } = selectEligibleMarkets(markets, {
+      predictOnly: true,
+      includeNoise,
+      tradeableOnly: !includeClosed,
+      requireRewards: hasActiveRewards,
+      minHourlyRate: Number.isFinite(minHourlyRate) ? minHourlyRate : 0
+    });
     const withPoly = markets.filter((m) => m.hasPolymarket);
 
     return NextResponse.json({
@@ -103,6 +102,8 @@ export async function GET(request: Request) {
       totalCategories,
       totalUniqueMarketIds,
       categoriesWithoutMarkets,
+      complete,
+      filterStats,
       totalMarkets: markets.length,
       withPolymarketCount: withPoly.length,
       predictOnlyCount: predictOnly.length,

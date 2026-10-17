@@ -7,6 +7,9 @@ export type MarketsCacheEntry = {
   totalUniqueMarketIds: number;
   pagesFetched: number;
   stoppedReason: string;
+  complete: boolean;          // 是否翻到底（false = 页数上限 / 中途报错，数据不完整）
+  statusFilter: string | null; // 服务端 status 过滤值（null = 全量）
+  pageSize: number;            // API 实际每页返回的 category 数
   fetchedAt: string;
   durationMs: number;
 };
@@ -44,6 +47,9 @@ export function getCacheStatus() {
     totalCategories: entry?.totalCategories ?? 0,
     pagesFetched: entry?.pagesFetched ?? 0,
     stoppedReason: entry?.stoppedReason ?? null,
+    complete: entry?.complete ?? null,
+    statusFilter: entry?.statusFilter ?? null,
+    pageSize: entry?.pageSize ?? 0,
     durationMs: entry?.durationMs ?? null,
     refreshInflight: !!globalThis.__predictMarketsInflight,
     timerActive: !!globalThis.__predictCacheTimer,
@@ -68,6 +74,9 @@ export async function refreshMarketsCache(maxPages = MAX_PAGES): Promise<Markets
       totalUniqueMarketIds: r.totalUniqueMarketIds,
       pagesFetched: r.pagesFetched,
       stoppedReason: r.stoppedReason,
+      complete: r.complete,
+      statusFilter: r.statusFilter,
+      pageSize: r.pageSize,
       fetchedAt: new Date().toISOString(),
       durationMs: Date.now() - start
     };
@@ -76,14 +85,24 @@ export async function refreshMarketsCache(maxPages = MAX_PAGES): Promise<Markets
     if (entry.markets.length === 0) {
       throw new Error(`got 0 markets (stop=${entry.stoppedReason})`);
     }
+    // 防回退：这次没翻到底、且比上一份缓存少很多（<70%），说明是半截数据，
+    // 保留旧缓存不覆盖，只记录错误。否则一次 429 就会把完整列表换成残缺的。
+    const prev = globalThis.__predictMarketsCache;
+    if (!entry.complete && prev && entry.markets.length < prev.markets.length * 0.7) {
+      globalThis.__predictCacheLastError = `本次抓取不完整（${entry.markets.length} markets，stop=${entry.stoppedReason}），已保留上一份缓存（${prev.markets.length} markets）`;
+      console.warn(`[predict-cache] ${globalThis.__predictCacheLastError}`);
+      return prev;
+    }
     globalThis.__predictMarketsCache = entry;
-    // 部分数据也算成功，但把 stoppedReason 里的错暴露出来
-    if (entry.stoppedReason.startsWith('cursor-rejected') || entry.stoppedReason.startsWith('fetch-error')) {
-      globalThis.__predictCacheLastError = `部分数据（${entry.markets.length} markets）。${entry.stoppedReason}`;
+    // 不完整的数据也算成功，但把原因暴露出来
+    if (!entry.complete) {
+      globalThis.__predictCacheLastError = `数据可能不完整（${entry.markets.length} markets）。stop=${entry.stoppedReason}`;
     } else {
       globalThis.__predictCacheLastError = undefined;
     }
-    console.log(`[predict-cache] refresh done: ${entry.markets.length} markets, ${entry.pagesFetched} pages, ${entry.durationMs}ms, stop=${entry.stoppedReason}`);
+    console.log(
+      `[predict-cache] refresh done: ${entry.markets.length} markets, ${entry.pagesFetched} pages (pageSize≈${entry.pageSize}, status=${entry.statusFilter ?? 'none'}), ${entry.durationMs}ms, stop=${entry.stoppedReason}, complete=${entry.complete}`
+    );
     const hooks = globalThis.__predictCacheHooks || [];
     for (const hook of hooks) {
       try {

@@ -67,6 +67,7 @@ export type PredictMarketSummary = {
   closed?: boolean;
   active?: boolean;
   category?: string;
+  categoryStatus?: string;
   endDate?: string;
   endMs?: number | null;
   volume?: number;

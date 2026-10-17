@@ -1,4 +1,4 @@
-import { filterOutNoise, filterPredictOnly, groupMarketsByCategory, type MarketGroup } from './predict-markets';
+import { selectEligibleGroups, type MarketGroup } from './predict-markets';
 import { getSubscriptions, type SubMode } from './subscribers';
 import type { MarketsCacheEntry } from './predict-cache';
 
@@ -177,15 +177,13 @@ export function computeEligibleGroups(entry: MarketsCacheEntry, mode: SubMode): 
   predictOnlyCount: number;
   noiseRemoved: number;
 } {
-  // mode='all' 时不做 polymarket 过滤；'predict_only' 时只留无 poly 映射的
-  const base = mode === 'all' ? entry.markets : filterPredictOnly(entry.markets);
-  const afterNoise = filterOutNoise(base);
-  const noiseRemoved = base.length - afterNoise.length;
-  const eligible = afterNoise.filter((m) => m.tradeable && m.hourlyRate > 0);
-  const groups = groupMarketsByCategory(eligible)
-    .filter((g) => g.totalHourlyRate > 0)
-    .sort((a, b) => (b.totalHourlyRate || 0) - (a.totalHourlyRate || 0));
-  return { groups, predictOnlyCount: base.length, noiseRemoved };
+  // mode='all' 时不做 polymarket 过滤；'predict_only' 时只留无 poly 映射的。
+  // 筛选口径与 bot /predict_only 完全一致（selectEligibleGroups）。
+  const { groups, stats } = selectEligibleGroups(entry.markets, {
+    predictOnly: mode !== 'all',
+    requireRewards: true
+  });
+  return { groups, predictOnlyCount: stats.afterPolymarket, noiseRemoved: stats.afterPolymarket - stats.afterNoise };
 }
 
 async function notifyForMode(entry: MarketsCacheEntry, mode: SubMode): Promise<NewMarketsResult> {

@@ -182,8 +182,16 @@ function isTradeable(market: any, endMs: number | null): boolean {
   if (!market) return false;
   if (market.isResolved === true) return false;
   if (market.resolvedAt != null) return false;
-  const status = String(market.tradingStatus ?? market.status ?? '').toUpperCase();
-  if (status && CLOSED_STATUSES.has(status)) return false;
+  if (market.closed === true) return false;
+  if (market.active === false) return false;
+  // 市场自身状态 + 交易状态都要看（两者可能不一致，任一关闭即不可交易）
+  for (const v of [market.tradingStatus, market.status]) {
+    const status = String(v ?? '').toUpperCase();
+    if (status && CLOSED_STATUSES.has(status)) return false;
+  }
+  // 父 category 已 RESOLVED/CLOSED 时，里面的市场不可交易（predict 文档明确）
+  const catStatus = String(market.categoryStatus ?? '').toUpperCase();
+  if (catStatus && CLOSED_STATUSES.has(catStatus)) return false;
   if (endMs != null && endMs <= Date.now()) return false;
   return true;
 }
@@ -217,6 +225,7 @@ export function normalizeMarket(raw: any): PredictMarketSummary {
   const closed = typeof raw?.closed === 'boolean' ? raw.closed : undefined;
   const active = typeof raw?.active === 'boolean' ? raw.active : undefined;
   const category = raw?.category ? String(raw.category) : raw?.categoryName ? String(raw.categoryName) : undefined;
+  const categoryStatus = raw?.categoryStatus ? String(raw.categoryStatus) : undefined;
   const endMs = marketEndMs(raw);
   const volume = numberOrNull(raw?.volume ?? raw?.totalVolume ?? raw?.total_volume) ?? undefined;
   const liquidity = numberOrNull(raw?.liquidity ?? raw?.totalLiquidity ?? raw?.total_liquidity) ?? undefined;
@@ -237,6 +246,7 @@ export function normalizeMarket(raw: any): PredictMarketSummary {
     closed,
     active,
     category,
+    categoryStatus,
     endDate: endMs ? new Date(endMs).toISOString() : undefined,
     endMs,
     volume,
@@ -281,6 +291,18 @@ function pickCursorFromResponse(raw: unknown): string {
       root?.meta?.nextCursor ||
       ''
   );
+}
+
+// 响应里是否"明确带了 cursor 字段"（哪怕值是 null/空串）。
+// 带了但为空 = 服务端说没有下一页，应视为翻到底，而不是退回 lastId 再试一次换来 400。
+const CURSOR_KEYS = ['cursor', 'nextCursor', 'next_cursor', 'endCursor', 'end_cursor'];
+function responseDeclaresCursor(raw: unknown): boolean {
+  const root = raw as any;
+  if (!root || typeof root !== 'object') return false;
+  for (const holder of [root, root.data, root.pageInfo, root.page_info, root.pagination, root.meta]) {
+    if (holder && typeof holder === 'object' && CURSOR_KEYS.some((k) => k in holder)) return true;
+  }
+  return false;
 }
 
 export async function fetchAllPredictMarkets(options: FetchOptions = {}): Promise<{
@@ -429,6 +451,71 @@ export function filterOutNoise(markets: PredictMarketSummary[]): PredictMarketSu
   return markets.filter((m) => !isNoiseMarket(m));
 }
 
+// ============================================================
+// 统一的筛选入口：bot / 订阅推送 / API 都走这里，保证口径一致。
+// 顺序：polymarket 过滤 → 噪音过滤 → 可交易 → PP 门槛，每步计数便于排查"为什么少了"。
+// ============================================================
+export type SelectOptions = {
+  predictOnly?: boolean;      // 只要没有 polymarket 映射的（默认 true）
+  includeNoise?: boolean;     // 保留噪音市场（默认 false）
+  tradeableOnly?: boolean;    // 只要可交易的（默认 true）
+  requireRewards?: boolean;   // 只要 PP/h > 0 的（默认 true）
+  minHourlyRate?: number;     // PP/h 下限（默认 0）
+};
+
+export type SelectStats = {
+  input: number;
+  afterPolymarket: number;
+  afterNoise: number;
+  afterTradeable: number;
+  afterRewards: number;
+  output: number;
+};
+
+export function selectEligibleMarkets(
+  markets: PredictMarketSummary[],
+  options: SelectOptions = {}
+): { markets: PredictMarketSummary[]; stats: SelectStats } {
+  const predictOnly = options.predictOnly ?? true;
+  const includeNoise = options.includeNoise ?? false;
+  const tradeableOnly = options.tradeableOnly ?? true;
+  const requireRewards = options.requireRewards ?? true;
+  const minHourlyRate = Number.isFinite(options.minHourlyRate) ? Number(options.minHourlyRate) : 0;
+
+  let list = markets;
+  const stats: SelectStats = { input: list.length, afterPolymarket: 0, afterNoise: 0, afterTradeable: 0, afterRewards: 0, output: 0 };
+
+  if (predictOnly) list = filterPredictOnly(list);
+  stats.afterPolymarket = list.length;
+
+  if (!includeNoise) list = filterOutNoise(list);
+  stats.afterNoise = list.length;
+
+  if (tradeableOnly) list = list.filter((m) => m.tradeable);
+  stats.afterTradeable = list.length;
+
+  if (requireRewards) list = list.filter((m) => (m.hourlyRate || 0) > 0);
+  if (minHourlyRate > 0) list = list.filter((m) => (m.hourlyRate || 0) >= minHourlyRate);
+  stats.afterRewards = list.length;
+
+  list = [...list].sort((a, b) => (b.hourlyRate || 0) - (a.hourlyRate || 0));
+  stats.output = list.length;
+  return { markets: list, stats };
+}
+
+// 选出来的市场按 event 分组 + 只留有 PP 的 event，按总 PP/h 降序
+export function selectEligibleGroups(markets: PredictMarketSummary[], options: SelectOptions = {}): {
+  groups: MarketGroup[];
+  stats: SelectStats;
+} {
+  const { markets: eligible, stats } = selectEligibleMarkets(markets, options);
+  const requireRewards = options.requireRewards ?? true;
+  let groups = groupMarketsByCategory(eligible);
+  if (requireRewards) groups = groups.filter((g) => g.totalHourlyRate > 0);
+  groups.sort((a, b) => (b.totalHourlyRate || 0) - (a.totalHourlyRate || 0));
+  return { groups, stats };
+}
+
 export type MarketGroup = {
   slug: string;
   title: string;
@@ -505,11 +592,58 @@ function parseLinkHeader(link: string | undefined): string {
   }
 }
 
-export async function fetchAllPredictCategories(options: { limit?: number; maxPages?: number } = {}): Promise<{
+// 只抓这些状态的 category（服务端过滤，省掉已结算的几千页）。
+// 默认 OPEN；设 PREDICT_CATEGORY_STATUS=none 关闭服务端过滤。
+export function getCategoryStatusFilter(): string | null {
+  const env = process.env.PREDICT_CATEGORY_STATUS;
+  if (env == null) return 'OPEN';
+  const v = env.trim();
+  if (!v || v.toLowerCase() === 'none' || v === '0') return null;
+  return v;
+}
+
+// 这些结束原因代表"翻到底了"，其余（页数上限 / 报错）都算不完整
+const COMPLETE_STOP_REASONS = new Set(['exhausted', 'empty-page', 'no-new-ids', 'cursor-not-advancing']);
+export function isCompleteStop(stoppedReason: string): boolean {
+  return COMPLETE_STOP_REASONS.has(stoppedReason);
+}
+
+function isRetryableFetchError(msg: string): boolean {
+  if (/HTTP 4\d\d/.test(msg) && !/HTTP 429/.test(msg)) return false; // 4xx（除 429）不重试
+  return true; // 429 / 5xx / 超时 / 网络断 都重试
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// 带重试的单页抓取：429/5xx/超时 最多重试 PREDICT_FETCH_RETRIES 次（默认 4），指数退避
+async function fetchPageWithRetry(url: string, headers: Record<string, string>) {
+  const maxAttempts = 1 + (Number(process.env.PREDICT_FETCH_RETRIES) || 4);
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fetchJsonWithHeaders(url, { headers });
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!isRetryableFetchError(msg) || attempt === maxAttempts) throw err;
+      const wait = Math.min(15_000, 1000 * 2 ** (attempt - 1));
+      console.warn(`[predict] page fetch failed (attempt ${attempt}/${maxAttempts}), retry in ${wait}ms: ${msg.slice(0, 160)}`);
+      await sleep(wait);
+    }
+  }
+  throw lastErr;
+}
+
+export async function fetchAllPredictCategories(
+  options: { limit?: number; maxPages?: number; status?: string | null } = {}
+): Promise<{
   categories: PredictCategoryRaw[];
   pagesFetched: number;
   stoppedReason: string;
   totalUniqueIds: number;
+  complete: boolean;
+  statusFilter: string | null;
+  pageSize: number;
   firstPageDebug?: { responseKeys: string[] | null; headerKeys: string[]; sampleHeaderValues: Record<string, string> };
 }> {
   const apiKey = process.env.PREDICT_API_KEY;
@@ -518,6 +652,7 @@ export async function fetchAllPredictCategories(options: { limit?: number; maxPa
 
   const limit = options.limit ?? 100;
   const maxPages = options.maxPages ?? 100;
+  let statusFilter: string | null = options.status === undefined ? getCategoryStatusFilter() : options.status;
 
   const all: PredictCategoryRaw[] = [];
   const seen = new Set<string>();
@@ -526,28 +661,38 @@ export async function fetchAllPredictCategories(options: { limit?: number; maxPa
   let pagesFetched = 0;
   let stoppedReason = 'exhausted';
   let emptyPagesInARow = 0;
+  let pageSize = 0;
   let firstPageDebug: { responseKeys: string[] | null; headerKeys: string[]; sampleHeaderValues: Record<string, string> } | undefined;
 
-  while (pagesFetched < maxPages) {
+  const buildUrl = () => {
     const params = new URLSearchParams();
     params.set('first', String(limit));
     if (cursor) params.set('after', cursor);
+    if (statusFilter) params.set('status', statusFilter);
+    return `${PREDICT_REST_BASE}/categories?${params.toString()}`;
+  };
 
-    const url = `${PREDICT_REST_BASE}/categories?${params.toString()}`;
+  while (pagesFetched < maxPages) {
     let raw: unknown;
     let respHeaders: Record<string, string> = {};
     try {
-      const r = await fetchJsonWithHeaders(url, { headers });
+      const r = await fetchPageWithRetry(buildUrl(), headers);
       raw = r.json;
       respHeaders = r.headers;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('invalid_cursor') || msg.includes('400')) {
+      // 第一页就被 400 拒绝且带了 status 过滤：多半是 status 取值不被接受 → 去掉过滤重来
+      if (pagesFetched === 0 && statusFilter && /HTTP 400/.test(msg)) {
+        console.warn(`[predict] status=${statusFilter} rejected by API, falling back to unfiltered crawl: ${msg.slice(0, 160)}`);
+        statusFilter = null;
+        continue;
+      }
+      if (msg.includes('invalid_cursor') || /HTTP 400/.test(msg)) {
         stoppedReason = `cursor-rejected-page-${pagesFetched + 1}: ${msg.slice(0, 150)}`;
         console.warn(`[predict] cursor rejected after page ${pagesFetched}, keeping partial data:`, msg.slice(0, 200));
         break;
       }
-      // 其它错（429/5xx 等）：保留已抓到的，停
+      // 重试用尽仍失败：保留已抓到的，停
       stoppedReason = `fetch-error-page-${pagesFetched + 1}: ${msg.slice(0, 150)}`;
       console.warn(`[predict] fetch error after page ${pagesFetched}, keeping partial:`, msg.slice(0, 200));
       break;
@@ -571,6 +716,13 @@ export async function fetchAllPredictCategories(options: { limit?: number; maxPa
     }
 
     const rows = pickArray(raw);
+    // 带 status 过滤的第一页就是空的：过滤值可能不匹配（比如大小写），退回全量抓取
+    if (!rows.length && pagesFetched === 1 && statusFilter) {
+      console.warn(`[predict] status=${statusFilter} returned 0 categories on page 1, falling back to unfiltered crawl`);
+      statusFilter = null;
+      pagesFetched = 0;
+      continue;
+    }
     if (!rows.length) {
       emptyPagesInARow += 1;
       if (emptyPagesInARow >= 2) {
@@ -580,6 +732,7 @@ export async function fetchAllPredictCategories(options: { limit?: number; maxPa
       continue;
     }
     emptyPagesInARow = 0;
+    pageSize = Math.max(pageSize, rows.length);
 
     const sizeBefore = seen.size;
     let lastRowId: string | null = null;
@@ -599,6 +752,11 @@ export async function fetchAllPredictCategories(options: { limit?: number; maxPa
     // 多个 cursor 候选，优先级 headers > response body > lastSlug > lastId
     const headerCursor = pickCursorFromHeaders(respHeaders) || parseLinkHeader(respHeaders['link']);
     const bodyCursor = pickCursorFromResponse(raw);
+    if (!headerCursor && !bodyCursor && responseDeclaresCursor(raw)) {
+      // 服务端明确返回了空 cursor：没有下一页了
+      stoppedReason = 'exhausted';
+      break;
+    }
     const nextCursor = headerCursor || bodyCursor || lastRowSlug || lastRowId || '';
 
     if (!nextCursor) {
@@ -620,12 +778,19 @@ export async function fetchAllPredictCategories(options: { limit?: number; maxPa
   if (pagesFetched >= maxPages && stoppedReason === 'exhausted') {
     stoppedReason = `hit-max-pages-${maxPages}`;
   }
+  const complete = isCompleteStop(stoppedReason);
+  console.log(
+    `[predict] categories crawl: ${all.length} categories, ${pagesFetched} pages (pageSize≈${pageSize}), status=${statusFilter ?? 'none'}, stop=${stoppedReason}, complete=${complete}`
+  );
 
   return {
     categories: all,
     pagesFetched,
     stoppedReason,
     totalUniqueIds: seen.size,
+    complete,
+    statusFilter,
+    pageSize,
     firstPageDebug
   };
 }
@@ -671,6 +836,7 @@ export async function fetchAllPredictMarketsViaCategories(options: {
   limit?: number;
   maxPages?: number;
   includeClosed?: boolean;
+  status?: string | null;
 } = {}): Promise<{
   markets: PredictMarketSummary[];
   pagesFetched: number;
@@ -678,12 +844,17 @@ export async function fetchAllPredictMarketsViaCategories(options: {
   totalCategories: number;
   totalUniqueMarketIds: number;
   categoriesWithoutMarkets: number;
+  complete: boolean;
+  statusFilter: string | null;
+  pageSize: number;
   source: 'categories';
 }> {
-  const { categories, pagesFetched, stoppedReason, totalUniqueIds } = await fetchAllPredictCategories({
-    limit: options.limit,
-    maxPages: options.maxPages
-  });
+  const { categories, pagesFetched, stoppedReason, totalUniqueIds, complete, statusFilter, pageSize } =
+    await fetchAllPredictCategories({
+      limit: options.limit,
+      maxPages: options.maxPages,
+      status: options.status
+    });
   const { markets, categoriesWithoutMarkets, totalMarketIds } = flattenCategoryMarkets(categories, {
     includeClosed: options.includeClosed ?? true
   });
@@ -694,6 +865,9 @@ export async function fetchAllPredictMarketsViaCategories(options: {
     totalCategories: totalUniqueIds,
     totalUniqueMarketIds: totalMarketIds,
     categoriesWithoutMarkets,
+    complete,
+    statusFilter,
+    pageSize,
     source: 'categories'
   };
 }
