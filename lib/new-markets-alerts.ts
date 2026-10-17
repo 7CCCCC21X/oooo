@@ -145,12 +145,11 @@ export function buildMessage(g: MarketGroup, idx: number, total: number, mode: S
   lines.push(`总 PP/h: ${fmt(g.totalHourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}`);
   if (g.markets.length > 1) {
     lines.push(`选项 (${g.markets.length}):`);
-    const shown = g.markets.slice(0, 10);
-    for (const m of shown) {
+    // 全部列出；超长消息由发送端（sendTextToChat）按行拆分
+    for (const m of g.markets) {
       const pp = m.hourlyRate > 0 ? ` · PP/h ${fmt(m.hourlyRate, 1)}` : '';
       lines.push(`  • ${m.title || '?'}${pp}`);
     }
-    if (g.markets.length > 10) lines.push(`  ...还有 ${g.markets.length - 10} 个`);
   }
   lines.push('');
   lines.push(g.url);

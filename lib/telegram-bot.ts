@@ -90,8 +90,36 @@ async function reply(chatId: number | string, threadId: number | null, text: str
   });
 }
 
+// Telegram 单条上限 4096，留余量。超长文本按行切成多段，不再硬截断。
+const TG_MAX_TEXT = 3800;
+function splitLongText(text: string, max = TG_MAX_TEXT): string[] {
+  if (text.length <= max) return [text];
+  const parts: string[] = [];
+  let buf = '';
+  for (const line of text.split('\n')) {
+    const sep = buf ? '\n' : '';
+    if (buf.length + sep.length + line.length > max) {
+      if (buf) parts.push(buf);
+      // 单行本身超长（极少见）：硬切
+      buf = line.length > max ? line.slice(0, max) : line;
+    } else {
+      buf += sep + line;
+    }
+  }
+  if (buf) parts.push(buf);
+  return parts;
+}
+
+async function replyLong(chatId: number | string, threadId: number | null, text: string): Promise<void> {
+  const parts = splitLongText(text);
+  for (let i = 0; i < parts.length; i++) {
+    if (i > 0) await new Promise((r) => setTimeout(r, 1200));
+    await reply(chatId, threadId, parts[i]);
+  }
+}
+
 export async function sendTextToChat(chatId: string, text: string, threadId: number | null = null): Promise<void> {
-  await reply(chatId, threadId, text);
+  await replyLong(chatId, threadId, text);
 }
 
 async function tgSendDocument(
@@ -241,14 +269,17 @@ async function sendInChunks(chatId: number | string, threadId: number | null, he
     await reply(chatId, threadId, header);
     return;
   }
-  const MAX = 3800;
+  const MAX = TG_MAX_TEXT;
   const messages: string[] = [];
   let buf = header;
   for (const item of items) {
     const sep = buf ? '\n\n' : '';
     if (buf.length + sep.length + item.length > MAX) {
-      messages.push(buf);
-      buf = item;
+      if (buf) messages.push(buf);
+      // 单个 item 超过一条消息：按行拆开，最后一段继续作为当前 buf 累积
+      const pieces = splitLongText(item, MAX);
+      messages.push(...pieces.slice(0, -1));
+      buf = pieces[pieces.length - 1];
     } else {
       buf += sep + item;
     }
@@ -299,20 +330,16 @@ async function handlePredictOnly(chatId: number | string, threadId: number | nul
     const totalPP = groups.reduce((s, g) => s + g.totalHourlyRate, 0);
     const header = `📊 Predict 独有市场（在派 PP）\n共 ${groups.length} 个 event / ${totalFound} 个市场\n总 PP/h = ${fmt(totalPP, 1)}（抓取 ${pagesFetched} 页 · stop=${stoppedReason}）\n`;
 
-    const MAX_OPTIONS_INLINE = 12;
+    // 选项全部列出，不再截断；超长由 sendInChunks 按行拆成多条消息
     const items = groups.map((g, i) => {
       const remain = fmtRemaining(g.endMs);
       const lines = [`${i + 1}. ${g.title}`];
       lines.push(`   总 PP/h: ${fmt(g.totalHourlyRate, 1)}${remain ? ` · ⏰ ${remain}` : ''}`);
       if (g.markets.length > 1) {
-        const shown = g.markets.slice(0, MAX_OPTIONS_INLINE);
         lines.push(`   选项 (${g.markets.length}):`);
-        for (const m of shown) {
+        for (const m of g.markets) {
           const pp = m.hourlyRate > 0 ? ` · PP/h ${fmt(m.hourlyRate, 1)}` : '';
           lines.push(`     • ${m.title || '?'}${pp}`);
-        }
-        if (g.markets.length > MAX_OPTIONS_INLINE) {
-          lines.push(`     ...还有 ${g.markets.length - MAX_OPTIONS_INLINE} 个`);
         }
       }
       lines.push(`   ${g.url}`);
