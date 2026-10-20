@@ -1,4 +1,7 @@
+import { fetchJson } from './fetch-json';
 import type { BookLevel, TopBook } from './types';
+
+const PREDICT_BASE = 'https://api.predict.fun';
 function numberOrNull(value: unknown): number | null {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
@@ -39,15 +42,12 @@ export function topOfBook(raw: unknown): TopBook {
     askDepth: asks.length
   };
 }
-export function complementBook(book: TopBook): TopBook {
-  return {
-    bid: book.ask ? { price: 1 - book.ask.price, size: book.ask.size } : null,
-    ask: book.bid ? { price: 1 - book.bid.price, size: book.bid.size } : null,
-    bidDepth: book.askDepth,
-    askDepth: book.bidDepth
-  };
-}
-export function midPrice(book: TopBook): number | null {
-  if (!book.bid || !book.ask) return null;
-  return (book.bid.price + book.ask.price) / 2;
+// predict.fun 某个市场的 Yes 订单簿顶层（bids = 买 Yes，asks = 卖 Yes）
+export async function getPredictYesBook(marketId: string): Promise<TopBook> {
+  const apiKey = process.env.PREDICT_API_KEY;
+  if (!apiKey) throw new Error('Missing PREDICT_API_KEY');
+  const raw = await fetchJson(`${PREDICT_BASE}/v1/markets/${encodeURIComponent(marketId)}/orderbook`, {
+    headers: { 'x-api-key': apiKey }
+  });
+  return topOfBook(raw);
 }

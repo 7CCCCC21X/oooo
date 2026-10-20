@@ -164,7 +164,7 @@ h1 {
   margin-top: 8px;
   font-size: 20px;
 }
-.tableCard, .editorCard, .resolverCard {
+.tableCard, .resolverCard {
   margin-top: 16px;
 }
 .sectionHeader {
@@ -219,7 +219,7 @@ tr.hit {
   color: var(--muted);
   text-align: center;
 }
-.editorCard textarea, .resolverCard textarea {
+.resolverCard textarea {
   width: 100%;
   min-height: 260px;
   padding: 16px;
@@ -235,7 +235,7 @@ tr.hit {
 .resolverCard textarea {
   min-height: 220px;
 }
-.editorActions, .resolverRow {
+.resolverRow {
   display: flex;
   gap: 12px;
   flex-wrap: wrap;

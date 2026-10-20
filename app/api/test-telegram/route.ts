@@ -18,7 +18,7 @@ export async function GET(request: NextRequest) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
   const customText = request.nextUrl.searchParams.get('text') || '';
-  const text = customText || `✅ Predict-Poly monitor test\n时间: ${new Date().toISOString()}\n如果你收到这条，说明 Telegram 推送通道工作正常。`;
+  const text = customText || `✅ Predict bot test\n时间: ${new Date().toISOString()}\n如果你收到这条，说明 Telegram 推送通道工作正常。`;
 
   if (!token) {
     return NextResponse.json({ ok: false, error: 'TELEGRAM_BOT_TOKEN is not set in env' }, { status: 400 });

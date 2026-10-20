@@ -20,7 +20,7 @@ import { fetchJson } from './fetch-json';
 import { getCachedMarkets } from './predict-cache';
 import { groupMarketsByCategory, normalizeCategoryMarkets, predictMarketUrl, type MarketGroup } from './predict-markets';
 import { extractPredictSlug } from './predict-url';
-import { getPredictYesBook } from './spread';
+import { getPredictYesBook } from './orderbooks';
 import { getSubscriptions } from './subscribers';
 import type { PredictMarketSummary, TopBook } from './types';
 

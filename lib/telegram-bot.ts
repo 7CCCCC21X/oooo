@@ -24,9 +24,6 @@ import {
   type SubMode
 } from './subscribers';
 import { getWatcherStatus, registerAlertSendFn } from './new-markets-alerts';
-import { runMonitorCycle } from './monitor';
-import { loadPairs } from './pairs';
-import { getSpreadAlertsStatus, setSpreadAlertsEnabled } from './alert-state';
 import { CODE_VERSION } from './version';
 
 declare global {
@@ -202,7 +199,6 @@ const MENU_KEYBOARD = {
     [{ text: '🔔 订阅·Yes总和提醒', callback_data: 'subscribe_negrisk' }],
     [{ text: '🔕 取消本话题订阅', callback_data: 'unsubscribe' }],
     [{ text: '🔄 强制刷新缓存', callback_data: 'refresh_cache' }],
-    [{ text: '🚨 立即跑一次价差检查', callback_data: 'check_spreads' }],
     [{ text: 'ℹ️ 监控状态', callback_data: 'status' }, { text: '❓ 帮助', callback_data: 'help' }]
   ]
 };
@@ -399,71 +395,14 @@ async function handlePredictOnly(chatId: number | string, threadId: number | nul
   }
 }
 
-async function handleCheckSpreads(chatId: number | string, threadId: number | null) {
-  await reply(chatId, threadId, '⏳ 正在跑一次价差检查...');
-  try {
-    const result = await runMonitorCycle();
-    const lines = [
-      `检查时间: ${result.checkedAt}`,
-      `配置对数: ${result.pairCount}`,
-      `原始触发: ${result.rawAlertCount}`,
-      `本轮发送: ${result.alertCount}（cooldown 内的会跳过）`,
-      `Telegram 推送: ${result.alertsMuted ? '🔕 已关闭（/spread_on 开启）' : result.telegramSent ? '✅' : '⏭️'}${result.telegramError ? ` 错误: ${result.telegramError}` : ''}`
-    ];
-    if (!result.alertCount && result.results.length) {
-      const best = [...result.results]
-        .filter((r) => r.ok && typeof r.gap === 'number')
-        .sort((a, b) => (b.gap || 0) - (a.gap || 0))[0];
-      if (best) {
-        lines.push('');
-        lines.push(`当前最大价差: ${best.pair.name}`);
-        lines.push(`  方向: ${best.directionLabel}`);
-        lines.push(`  gap: ${fmt(best.gap, 4)} = ${fmt(best.gapCents, 2)}¢ (阈值 ${fmt(best.threshold, 4)})`);
-      }
-    }
-    await reply(chatId, threadId, lines.join('\n'));
-  } catch (err) {
-    await reply(chatId, threadId, `❌ 检查失败: ${err instanceof Error ? err.message : String(err)}`);
-  }
-}
-
-async function handleSpreadToggle(
-  chatId: number | string,
-  threadId: number | null,
-  enable: boolean
-) {
-  const r = setSpreadAlertsEnabled(enable, String(chatId));
-  if (!r.changed) {
-    await reply(chatId, threadId, enable ? '价差提醒已经是开启状态。' : '价差提醒已经是关闭状态。');
-    return;
-  }
-  if (enable) {
-    await reply(chatId, threadId, '✅ 价差提醒已开启。后台监控继续跑，触发会推送到 Telegram。');
-  } else {
-    await reply(
-      chatId,
-      threadId,
-      '🔕 价差提醒已关闭。后台监控仍在跑，但不会再推送 Telegram；用 /spread_on 重新开启，或 /check 手动查看当前价差。'
-    );
-  }
-}
-
 async function handleStatus(chatId: number | string, threadId: number | null) {
-  const pairs = loadPairs();
   const cache = getCacheStatus();
   const watcher = getWatcherStatus();
   const subs = getSubscriptions();
-  const alertState = getSpreadAlertsStatus();
   const lines = [
-    `🟢 监控状态`,
-    `价差提醒: ${alertState.enabled ? '✅ 开启' : '🔕 关闭'}${alertState.changedAt ? `（${alertState.changedAt} 改）` : ''}`,
-    `进程内监控: ${globalThis.__spreadMonitorTimer ? '运行中' : '未启动'}`,
+    `🟢 运行状态`,
     `Bot 长轮询: ${globalThis.__tgBotPolling ? '运行中' : '未启动'}`,
-    `配置对数: ${pairs.length}`,
-    `轮询间隔: ${process.env.MONITOR_INTERVAL_MS || '60000'} ms`,
-    `阈值: ${process.env.ALERT_THRESHOLD || '0.015'}`,
-    `Cooldown: ${process.env.ALERT_COOLDOWN_SEC || '300'} s`,
-    `最近一次 cycle: ${globalThis.__tgBotLastCycleAt || '(尚未记录)'}`,
+    `最近收到消息: ${globalThis.__tgBotLastCycleAt || '(尚未记录)'}`,
     '',
     `📦 Predict 市场缓存`,
     `状态: ${cache.hasCache ? '✅ 已缓存' : '⏳ 未缓存'}${cache.refreshInflight ? '（刷新中）' : ''}`,
@@ -616,9 +555,6 @@ async function handleHelp(chatId: number | string, threadId: number | null) {
     '/yes_threshold [数值] - 查看/设置提醒阈值（¢，默认 100）',
     '/yes_on /yes_off - 开关 Yes 总和提醒',
     '/subscribe_yes - 本话题订阅 Yes 总和提醒',
-    '/check - 立即跑一次价差检查',
-    '/spread_off - 关闭价差提醒（监控继续跑但不推送）',
-    '/spread_on - 重新开启价差提醒',
     '/status - 监控运行状态',
     '/help - 显示这条帮助',
     '',
@@ -638,7 +574,7 @@ async function handleCommand(
   switch (cmd) {
     case '/start':
     case '/menu':
-      await sendMenu(chatId, threadId, '👋 欢迎使用 Predict-Poly 监控机器人。\n\n');
+      await sendMenu(chatId, threadId, '👋 欢迎使用 Predict 监控机器人。\n\n');
       return;
     case '/subscribe':
       await handleSubscribe(chatId, threadId, chatType, 'predict_only');
@@ -697,20 +633,6 @@ async function handleCommand(
     case '/subscribe_negrisk':
       await handleSubscribe(chatId, threadId, chatType, 'negrisk');
       return;
-    case '/check':
-    case '/spreads':
-      await handleCheckSpreads(chatId, threadId);
-      return;
-    case '/spread_off':
-    case '/spreadoff':
-    case '/alerts_off':
-      await handleSpreadToggle(chatId, threadId, false);
-      return;
-    case '/spread_on':
-    case '/spreadon':
-    case '/alerts_on':
-      await handleSpreadToggle(chatId, threadId, true);
-      return;
     case '/refresh':
       await handleRefreshCache(chatId, threadId);
       return;
@@ -760,9 +682,6 @@ async function handleCallback(query: TgCallbackQuery) {
       break;
     case 'refresh_cache':
       await handleRefreshCache(chatId, threadId);
-      break;
-    case 'check_spreads':
-      await handleCheckSpreads(chatId, threadId);
       break;
     case 'status':
       await handleStatus(chatId, threadId);
@@ -839,7 +758,6 @@ async function registerCommandsMenu() {
         { command: 'subscribers', description: '查看订阅列表' },
         { command: 'id', description: '查看当前 chat id' },
         { command: 'refresh', description: '强制刷新缓存' },
-        { command: 'check', description: '立即跑一次价差检查' },
         { command: 'status', description: '监控/缓存状态' },
         { command: 'help', description: '帮助' }
       ]

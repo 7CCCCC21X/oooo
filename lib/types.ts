@@ -1,18 +1,3 @@
-export type PredictSide = 'Yes' | 'No';
-export type PairConfig = {
-  name: string;
-  predictMarketId: string;
-  predictSide?: PredictSide;
-  polymarketConditionId?: string;
-  polymarketOutcome?: string;
-  polymarketTokenId?: string;
-  outcome?: PredictSide;
-  polymarketYesTokenId?: string;
-  polymarketNoTokenId?: string;
-  threshold?: number;
-  minSize?: number;
-  feeBuffer?: number;
-};
 export type BookLevel = {
   price: number;
   size: number;
@@ -22,37 +7,6 @@ export type TopBook = {
   ask: BookLevel | null;
   bidDepth: number;
   askDepth: number;
-};
-export type SpreadDirection = 'BUY_PREDICT_SELL_POLY' | 'BUY_POLY_SELL_PREDICT';
-export type SpreadResult = {
-  pair: PairConfig;
-  checkedAt: string;
-  ok: boolean;
-  error?: string;
-  predictBook?: TopBook;
-  polyBook?: TopBook;
-  direction?: SpreadDirection;
-  directionLabel?: string;
-  buyVenue?: 'Predict.fun' | 'Polymarket';
-  sellVenue?: 'Predict.fun' | 'Polymarket';
-  buyPrice?: number;
-  sellPrice?: number;
-  gap?: number;
-  gapCents?: number;
-  comparableSize?: number;
-  threshold: number;
-  minSize: number;
-  feeBuffer: number;
-  alert: boolean;
-};
-export type ResolveResult = {
-  predictMarketId: string;
-  predictTitle: string;
-  polymarketConditionId: string;
-  tokenCount: number;
-  tokens: Array<{ outcome: string; tokenId: string }>;
-  pairs: PairConfig[];
-  mappingNote: string;
 };
 export type PredictMarketSummary = {
   id: string;
