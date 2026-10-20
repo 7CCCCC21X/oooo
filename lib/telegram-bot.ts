@@ -3,12 +3,14 @@ import {
   analyzeCategoryBySlugOrUrl,
   formatCategoryReport,
   formatScanReport,
+  getNegRiskDisplayMin,
   getNegRiskStatus,
   getNegRiskThreshold,
   isNegRiskAlertsEnabled,
   registerNegRiskSendFn,
   scanConvertibleCategories,
   setNegRiskAlertsEnabled,
+  setNegRiskDisplayMin,
   setNegRiskThreshold
 } from './negrisk';
 import { findPredictUrl } from './predict-url';
@@ -481,7 +483,7 @@ async function handleStatus(chatId: number | string, threadId: number | null) {
   const nr = getNegRiskStatus();
   lines.push('');
   lines.push(`🔁 可转换市场 Yes 总和检查`);
-  lines.push(`提醒: ${nr.enabled ? '✅ 开启' : '🔕 关闭'} · 阈值 ${nr.thresholdCents}¢ · 每 ${Math.round(nr.intervalMs / 60000)} 分钟 · cooldown ${nr.cooldownSec}s · 定时器 ${nr.timerActive ? '运行中' : '未启动'}`);
+  lines.push(`提醒: ${nr.enabled ? '✅ 开启' : '🔕 关闭'} · 提醒阈值 ${nr.thresholdCents}¢ · 显示下限 ${nr.displayMinCents}¢ · 每 ${Math.round(nr.intervalMs / 60000)} 分钟 · cooldown ${nr.cooldownSec}s · 定时器 ${nr.timerActive ? '运行中' : '未启动'}`);
   lines.push(`订阅话题: ${nr.subscribers}${nr.subscribers ? '' : '（无，发到 TELEGRAM_CHAT_ID）'}`);
   if (nr.lastCycle) {
     const c = nr.lastCycle;
@@ -519,14 +521,53 @@ async function handleYes(chatId: number | string, threadId: number | null, input
   }
 }
 
-async function handleYesCheck(chatId: number | string, threadId: number | null) {
-  await reply(chatId, threadId, '⏳ 正在扫描全部可转换类目（按结果数可能要几十秒）...');
+// 解析 "95" / "95¢" / "all" / "全部" 为显示下限；无参数用持久化的下限；不合法返回 undefined
+function parseFloorArg(args: string[]): { minCents: number; error?: string } {
+  if (!args.length) return { minCents: getNegRiskDisplayMin() };
+  const raw = args[0].trim().toLowerCase();
+  if (raw === 'all' || raw === '全部' || raw === '0') return { minCents: 0 };
+  const n = Number(raw.replace(/[¢%,，]/g, ''));
+  if (!Number.isFinite(n) || n < 0 || n > 1000) return { minCents: getNegRiskDisplayMin(), error: `下限无效: ${args[0]}（要 0-1000 的数字，单位 ¢，或 all）` };
+  return { minCents: n };
+}
+
+async function handleYesCheck(chatId: number | string, threadId: number | null, args: string[] = []) {
+  const { minCents, error } = parseFloorArg(args);
+  if (error) {
+    await reply(chatId, threadId, `❌ ${error}`);
+    return;
+  }
+  await reply(chatId, threadId, `⏳ 正在扫描全部可转换类目，列出 Σ Yes 买1 ≥ ${minCents}¢ 的（按结果数可能要几十秒）...`);
   try {
     const scan = await scanConvertibleCategories();
-    await replyLong(chatId, threadId, formatScanReport(scan, 10));
+    await replyLong(chatId, threadId, formatScanReport(scan, { minCents }));
   } catch (err) {
     await reply(chatId, threadId, `❌ 扫描失败: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+async function handleYesShow(chatId: number | string, threadId: number | null, args: string[]) {
+  const current = getNegRiskDisplayMin();
+  if (!args.length) {
+    await reply(
+      chatId,
+      threadId,
+      `当前显示下限: ${current}¢（/yes_check 和提醒里"接近阈值"会列出 Σ Yes 买1 ≥ 这个值的类目，低于提醒阈值 ${getNegRiskThreshold()}¢ 的也显示）\n设置: /yes_show 90\n只看一次不改设置: /yes_check 90`
+    );
+    return;
+  }
+  const { minCents, error } = parseFloorArg(args);
+  if (error) {
+    await reply(chatId, threadId, `❌ ${error}`);
+    return;
+  }
+  const set = setNegRiskDisplayMin(minCents);
+  if (set == null) {
+    await reply(chatId, threadId, `❌ 下限无效: ${args[0]}`);
+    return;
+  }
+  const warn = set >= getNegRiskThreshold() ? `\n⚠️ 下限不低于提醒阈值 ${getNegRiskThreshold()}¢，这样就只显示达标的` : '';
+  await reply(chatId, threadId, `✅ 显示下限已改为 ${set}¢（原 ${current}¢）${warn}`);
 }
 
 async function handleYesThreshold(chatId: number | string, threadId: number | null, args: string[]) {
@@ -570,7 +611,8 @@ async function handleHelp(chatId: number | string, threadId: number | null) {
     '/subscribers - 查看订阅列表',
     '/id - 查看当前 chat id 和 thread_id',
     '/yes <链接> - 查该类目所有结果的 Yes 买1 并求和（直接发链接也行）',
-    '/yes_check - 扫描全部可转换类目，列出 Yes 买1 总和最高的',
+    '/yes_check [下限|all] - 扫描全部可转换类目，列出 Yes 买1 总和 ≥ 下限的（低于提醒阈值的也显示）',
+    '/yes_show [下限] - 查看/设置默认显示下限（¢，默认 95）',
     '/yes_threshold [数值] - 查看/设置提醒阈值（¢，默认 100）',
     '/yes_on /yes_off - 开关 Yes 总和提醒',
     '/subscribe_yes - 本话题订阅 Yes 总和提醒',
@@ -629,7 +671,13 @@ async function handleCommand(
     case '/yes_check':
     case '/yescheck':
     case '/negrisk_check':
-      await handleYesCheck(chatId, threadId);
+      await handleYesCheck(chatId, threadId, args);
+      return;
+    case '/yes_show':
+    case '/yesshow':
+    case '/yes_min':
+    case '/yes_display':
+      await handleYesShow(chatId, threadId, args);
       return;
     case '/yes_threshold':
     case '/yesthreshold':
@@ -781,7 +829,8 @@ async function registerCommandsMenu() {
         { command: 'menu', description: '主菜单' },
         { command: 'predict_only', description: 'Predict 独有市场（在派 PP）' },
         { command: 'yes', description: '查链接类目的 Yes 买1 总和' },
-        { command: 'yes_check', description: '扫描可转换类目 Yes 买1 总和' },
+        { command: 'yes_check', description: '扫描可转换类目 Yes 买1 总和（可带下限）' },
+        { command: 'yes_show', description: '查看/设置显示下限' },
         { command: 'yes_threshold', description: '查看/设置 Yes 总和提醒阈值' },
         { command: 'subscribe_yes', description: '订阅 Yes 总和提醒' },
         { command: 'subscribe', description: '订阅 Predict 独有新市场' },

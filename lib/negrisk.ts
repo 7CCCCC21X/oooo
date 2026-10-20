@@ -69,7 +69,8 @@ export type ScanResult = {
   hits: CategoryAnalysis[]; // bidSum ≥ 阈值
 };
 
-type NegRiskState = { thresholdCents: number; enabled: boolean; changedAt?: string };
+// thresholdCents：提醒阈值；displayMinCents：显示下限（扫描报告 / 提醒里"接近阈值"的范围）
+type NegRiskState = { thresholdCents: number; displayMinCents: number; enabled: boolean; changedAt?: string };
 type SendFn = (chatId: string, text: string, threadId: number | null) => Promise<void>;
 type LastCycle = {
   at: string;
@@ -127,9 +128,12 @@ function stateFile(): string {
   return subs ? path.join(path.dirname(subs), 'negrisk-state.json') : '';
 }
 
+const DEFAULT_DISPLAY_MIN_CENTS = 95;
+
 function defaultState(): NegRiskState {
   return {
     thresholdCents: envNumber('NEGRISK_ALERT_THRESHOLD', DEFAULT_THRESHOLD_CENTS),
+    displayMinCents: envNumber('NEGRISK_DISPLAY_MIN', DEFAULT_DISPLAY_MIN_CENTS),
     enabled: process.env.DISABLE_NEGRISK_ALERTS !== '1'
   };
 }
@@ -144,6 +148,8 @@ function loadState(): NegRiskState {
         const data = JSON.parse(fs.readFileSync(f, 'utf-8'));
         const t = Number(data?.thresholdCents);
         if (Number.isFinite(t) && t > 0) state.thresholdCents = t;
+        const d = Number(data?.displayMinCents);
+        if (Number.isFinite(d) && d >= 0) state.displayMinCents = d;
         if (typeof data?.enabled === 'boolean') state.enabled = data.enabled;
         if (typeof data?.changedAt === 'string') state.changedAt = data.changedAt;
       }
@@ -181,8 +187,27 @@ export function setNegRiskThreshold(value: number): number | null {
   return n;
 }
 
+// 显示下限：扫描报告列出 Σ Yes 买1 ≥ 这个值的类目（可以低于提醒阈值）
+export function getNegRiskDisplayMin(): number {
+  return loadState().displayMinCents;
+}
+
+export function setNegRiskDisplayMin(value: number): number | null {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0 || n > 1000) return null;
+  const state = loadState();
+  state.displayMinCents = n;
+  state.changedAt = new Date().toISOString();
+  persistState(state);
+  return n;
+}
+
 export function isNegRiskAlertsEnabled(): boolean {
   return loadState().enabled;
+}
+
+export function getLastScan(): ScanResult | null {
+  return globalThis.__negRiskLastCycle?.scan ?? null;
 }
 
 export function setNegRiskAlertsEnabled(enabled: boolean): { changed: boolean; enabled: boolean } {
@@ -204,6 +229,7 @@ export function getNegRiskStatus() {
   return {
     enabled: state.enabled,
     thresholdCents: state.thresholdCents,
+    displayMinCents: state.displayMinCents,
     changedAt: state.changedAt ?? null,
     stateFile: stateFile() || null,
     intervalMs: envNumber('NEGRISK_CHECK_INTERVAL_MS', 300_000),
@@ -305,8 +331,8 @@ export async function analyzeMarkets(
     outcomeCount: markets.length,
     tradeableCount: tradeable.length,
     outcomes,
-    bidSum,
-    askSum,
+    bidSum: Math.round(bidSum * 100) / 100, // 去掉浮点累加尾数
+    askSum: Math.round(askSum * 100) / 100,
     missingBids,
     failed,
     minBid,
@@ -505,7 +531,12 @@ function shortTitle(t: string): string {
   return s.length > 24 ? s.slice(0, 22) + '…' : s;
 }
 
-export function formatAlertMessage(hits: CategoryAnalysis[], thresholdCents: number): string {
+export function formatAlertMessage(
+  hits: CategoryAnalysis[],
+  thresholdCents: number,
+  near: CategoryAnalysis[] = [],
+  displayMinCents = getNegRiskDisplayMin()
+): string {
   const lines: string[] = [`🔁 可转换市场提醒：Yes 买1 总和 ≥ ${fmtC(thresholdCents)}（${hits.length} 个类目）`];
   hits.forEach((a, i) => {
     const edge = a.bidSum - 100;
@@ -517,27 +548,59 @@ export function formatAlertMessage(hits: CategoryAnalysis[], thresholdCents: num
     lines.push(`   ${outcomeSummary(a)}`);
     lines.push(`   ${a.url}`);
   });
+  if (near.length) {
+    lines.push('');
+    lines.push(`📉 接近阈值（≥ ${fmtC(displayMinCents)}，未达 ${fmtC(thresholdCents)}）：`);
+    for (const a of near) {
+      lines.push(`• ${fmtC(a.bidSum)} · ${a.title}（${a.tradeableCount} 个结果）`);
+      lines.push(`  ${a.url}`);
+    }
+  }
   return lines.join('\n');
 }
 
-export function formatScanReport(scan: ScanResult, top = 10): string {
+// 从扫描结果里取"接近阈值"的类目：显示下限 ≤ Σ < 提醒阈值
+export function nearThreshold(scan: ScanResult, displayMinCents = getNegRiskDisplayMin(), max = 5): CategoryAnalysis[] {
+  return scan.results.filter((r) => r.bidSum < scan.thresholdCents && r.bidSum >= displayMinCents).slice(0, max);
+}
+
+// minCents：显示下限（列出 Σ Yes 买1 ≥ minCents 的全部类目，低于提醒阈值的也显示）
+// max：最多列多少个，防止刷屏
+export function formatScanReport(
+  scan: ScanResult,
+  options: { minCents?: number; max?: number } = {}
+): string {
+  const minCents = options.minCents ?? getNegRiskDisplayMin();
+  const max = options.max ?? envNumber('NEGRISK_REPORT_MAX', 40);
   const lines: string[] = [
-    `🔁 可转换市场扫描（阈值 ${fmtC(scan.thresholdCents)}）`,
+    `🔁 可转换市场扫描（提醒阈值 ${fmtC(scan.thresholdCents)} · 显示下限 ${fmtC(minCents)}）`,
     `候选 ${scan.candidates} 个类目 · 预过滤跳过 ${scan.prefiltered} · 实际查询 ${scan.scanned}${scan.capped ? '（已达上限 NEGRISK_SCAN_MAX_CATEGORIES）' : ''} · 订单簿请求 ${scan.requests} · ${Math.round(scan.durationMs / 1000)}s`,
     `判定方式: ${scan.detectMode === 'flag' ? '接口 isNegRisk 字段' : '启发式（≥3 个结果的类目，接口没给 isNegRisk）'}`,
-    `达到阈值: ${scan.hits.length} 个`
+    `达到提醒阈值: ${scan.hits.length} 个`
   ];
   if (!scan.results.length) {
     lines.push('', '没有可扫描的类目。');
     return lines.join('\n');
   }
-  lines.push('', `Σ Yes 买1 最高的 ${Math.min(top, scan.results.length)} 个：`);
-  scan.results.slice(0, top).forEach((a, i) => {
+  let list = scan.results.filter((a) => a.bidSum >= minCents);
+  if (list.length) {
+    lines.push('', `Σ Yes 买1 ≥ ${fmtC(minCents)} 的 ${list.length} 个（✅ = 达到提醒阈值）：`);
+  } else {
+    // 下限以上一个都没有：仍然给最高的几个，免得空手而归
+    list = scan.results.slice(0, 5);
+    lines.push('', `没有 ≥ ${fmtC(minCents)} 的类目，最高的 ${list.length} 个：`);
+  }
+  const shown = list.slice(0, max);
+  shown.forEach((a, i) => {
     lines.push(
       `${i + 1}. ${a.bidSum >= scan.thresholdCents ? '✅' : '▫️'} ${fmtC(a.bidSum)} · ${a.title}（${a.tradeableCount} 个结果${a.failed ? `，❌${a.failed}` : ''}）`
     );
     lines.push(`   ${a.url}`);
   });
+  if (list.length > shown.length) {
+    lines.push(`…还有 ${list.length - shown.length} 个（提高下限：/yes_check 98，或改 NEGRISK_REPORT_MAX）`);
+  }
+  lines.push('', `换个下限看: /yes_check 90 · 固定下限: /yes_show 90 · 全部: /yes_check all`);
   return lines.join('\n');
 }
 
@@ -572,7 +635,7 @@ export async function runNegRiskCycle(): Promise<LastCycle> {
       const subs = getSubscriptions('negrisk');
       const targets = subs.length ? subs.map((s) => ({ chatId: s.chatId, threadId: s.threadId })) : [envTarget()].filter(Boolean) as Array<{ chatId: string; threadId: number | null }>;
       if (targets.length) {
-        const text = formatAlertMessage(fresh, scan.thresholdCents);
+        const text = formatAlertMessage(fresh, scan.thresholdCents, nearThreshold(scan));
         for (const t of targets) {
           try {
             await sendFn(t.chatId, text, t.threadId);
