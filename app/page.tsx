@@ -217,6 +217,7 @@ export default function HomePage() {
   return (
     <main className="shell">
       <nav className="nav">
+        <Link href="/dashboard">看板</Link>
         <Link href="/" className="active">价差监控</Link>
         <Link href="/predict-only">Predict 独有市场</Link>
       </nav>

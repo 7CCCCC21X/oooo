@@ -14,6 +14,8 @@ export async function GET() {
     botPolling: !!globalThis.__tgBotPolling,
     botLastEventAt: globalThis.__tgBotLastCycleAt || null,
     botLastError: globalThis.__tgBotLastError || null,
-    hasTelegram: !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID)
+    hasTelegram: !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID),
+    hasPredictApiKey: !!process.env.PREDICT_API_KEY,
+    env: process.env.NODE_ENV || 'development'
   });
 }

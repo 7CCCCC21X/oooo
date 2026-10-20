@@ -6,6 +6,7 @@
 
 - `/` 价差监控：根据 `config/pairs.json` 或浏览器本地配置，实时对比 predict.fun 和 polymarket 的 bid/ask，达阈值高亮 + Telegram 推送。
 - `/predict-only` Predict 独有市场 + PP/h：调用 predict.fun 全量 markets 接口，过滤出 `polymarketConditionIds` 为空的市场，按 PP/h 排序，可选只看 `hasActiveRewards`。
+- `/dashboard` 总览看板：NegRisk 可转换类目 Σ Yes 买1（提醒阈值 / 显示下限、单类目查询、每行重新查）、Predict 独有 PP/h 按 event 分组、市场缓存完整性与后台任务状态；每 60 秒自动刷新。
 
 ## API
 
@@ -35,6 +36,7 @@
 - `/yes_check [下限|all]`：扫描缓存里全部可转换类目，列出总和 ≥ 下限的（低于提醒阈值的也显示，✅ 标出达标的）。不带参数用 `/yes_show` 设的默认下限（默认 95¢）。
 - 提醒消息末尾附带"接近阈值"的类目（显示下限 ≤ 总和 < 提醒阈值，最多 5 个）。
 - `GET /api/negrisk?min=95` 读上次扫描结果（`scan=1` 立即扫一次）；`GET /api/negrisk?slug=<链接或slug>` 查单个类目。
+  - `?scan=1` 与后台扫描互斥，扫描进行中返回 409；手动扫描结果会写入「上次扫描」（不推送）。手动扫描期间恰好到点的后台扫描会跳过该轮，该周期的提醒顺延到下一轮。
 - 后台每 `NEGRISK_CHECK_INTERVAL_MS`（默认 5 分钟）扫一遍，总和 ≥ 阈值的类目推送到 `/subscribe_yes` 订阅的话题（没订阅就发 `TELEGRAM_CHAT_ID`）。
 - 阈值默认 100¢，`/yes_threshold 101` 随时改（持久化到 `NEGRISK_STATE_FILE`）；`/yes_off` `/yes_on` 开关。
 - 是否可转换按接口的 `isNegRisk` / `negRiskOnChainId` 判断；接口没给这些字段时退化为"≥3 个结果的类目"。

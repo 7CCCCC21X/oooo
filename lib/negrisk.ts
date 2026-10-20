@@ -77,6 +77,7 @@ type LastCycle = {
   scan: ScanResult | null;
   alertsSent: number;
   error?: string;
+  manual?: boolean; // 手动扫描（/api/negrisk?scan=1），不推送
 };
 
 declare global {
@@ -231,7 +232,6 @@ export function getNegRiskStatus() {
     thresholdCents: state.thresholdCents,
     displayMinCents: state.displayMinCents,
     changedAt: state.changedAt ?? null,
-    stateFile: stateFile() || null,
     intervalMs: envNumber('NEGRISK_CHECK_INTERVAL_MS', 300_000),
     cooldownSec: envNumber('NEGRISK_ALERT_COOLDOWN_SEC', 1800),
     timerActive: !!globalThis.__negRiskTimer,
@@ -242,6 +242,7 @@ export function getNegRiskStatus() {
           at: last.at,
           alertsSent: last.alertsSent,
           error: last.error ?? null,
+          manual: !!last.manual,
           detectMode: last.scan?.detectMode ?? null,
           candidates: last.scan?.candidates ?? 0,
           prefiltered: last.scan?.prefiltered ?? 0,
@@ -658,6 +659,27 @@ export async function runNegRiskCycle(): Promise<LastCycle> {
     globalThis.__negRiskLastCycle = cycle;
     console.error('[negrisk] cycle failed:', cycle.error);
     return cycle;
+  }
+}
+
+export class ScanBusyError extends Error {
+  constructor() {
+    super('扫描进行中，请稍后再试');
+    this.name = 'ScanBusyError';
+  }
+}
+
+// 手动扫一次（/api/negrisk?scan=1）：与后台 tick 互斥（同一个 __negRiskRunning 标志），
+// 成功的结果写入「上次扫描」（alertsSent 0、manual true），不推送提醒。
+export async function runManualScan(): Promise<ScanResult> {
+  if (globalThis.__negRiskRunning) throw new ScanBusyError();
+  globalThis.__negRiskRunning = true;
+  try {
+    const scan = await scanConvertibleCategories();
+    globalThis.__negRiskLastCycle = { at: scan.checkedAt, scan, alertsSent: 0, manual: true };
+    return scan;
+  } finally {
+    globalThis.__negRiskRunning = false;
   }
 }
 

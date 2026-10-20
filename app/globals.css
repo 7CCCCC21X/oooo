@@ -265,3 +265,27 @@ tr.hit {
   .hero, .summaryGrid { grid-template-columns: 1fr; }
   .sectionHeader { display: block; }
 }
+
+/* dashboard */
+.notice {
+  margin: 16px 0;
+  padding: 14px 16px;
+  border: 1px solid rgba(255, 200, 107, .45);
+  background: rgba(255, 200, 107, .12);
+  color: #ffe4b3;
+  border-radius: 14px;
+}
+.error ul, .notice ul { margin: 0; padding-left: 18px; }
+.error li + li, .notice li + li { margin-top: 4px; }
+.muted { color: var(--muted); }
+tr.near { background: rgba(255, 200, 107, .08); }
+.badge.warn { background: rgba(255, 200, 107, .16); color: #ffc86b; border-color: rgba(255, 200, 107, .3); }
+.badge.bad { background: rgba(255, 139, 139, .16); color: var(--bad); border-color: rgba(255, 139, 139, .3); }
+.stat small { display: block; margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.stat strong.ok { color: var(--good); }
+.stat strong.warn { color: #ffc86b; }
+.stat strong.bad { color: var(--bad); }
+.subTable { margin: 8px 0 4px; overflow-x: auto; }
+.subTable table { min-width: 0; font-size: 13px; }
+.subTable th, .subTable td { padding: 8px 10px; }
+button.sm { padding: 6px 10px; font-size: 13px; border-radius: 9px; margin-right: 6px; }

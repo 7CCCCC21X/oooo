@@ -4,7 +4,8 @@ import {
   getLastScan,
   getNegRiskDisplayMin,
   getNegRiskStatus,
-  scanConvertibleCategories
+  runManualScan,
+  ScanBusyError
 } from '@/lib/negrisk';
 
 export const dynamic = 'force-dynamic';
@@ -12,7 +13,7 @@ export const revalidate = 0;
 
 // GET /api/negrisk?slug=<链接或slug>          单个类目：每个结果 Yes 买1/卖1 + 总和
 // GET /api/negrisk?min=95&limit=50            上次扫描结果，按显示下限筛选
-// GET /api/negrisk?scan=1&min=95              立即扫一次再返回
+// GET /api/negrisk?scan=1&min=95              立即扫一次再返回（与后台扫描互斥，进行中返回 409；结果写入「上次扫描」，不推送）
 export async function GET(request: Request) {
   const url = new URL(request.url);
   const slug = url.searchParams.get('slug') || url.searchParams.get('url');
@@ -24,7 +25,7 @@ export async function GET(request: Request) {
     const minRaw = url.searchParams.get('min');
     const minCents = minRaw == null || minRaw === '' ? getNegRiskDisplayMin() : Number(minRaw);
     const limit = Number(url.searchParams.get('limit') || '100');
-    const scan = url.searchParams.get('scan') === '1' ? await scanConvertibleCategories() : getLastScan();
+    const scan = url.searchParams.get('scan') === '1' ? await runManualScan() : getLastScan();
     if (!scan) {
       return NextResponse.json({ ok: false, error: '还没有扫描结果（后台首次扫描在启动约 90 秒后；或加 ?scan=1 立即扫）', status: getNegRiskStatus() }, { status: 404 });
     }
@@ -49,6 +50,9 @@ export async function GET(request: Request) {
       results
     });
   } catch (error) {
+    if (error instanceof ScanBusyError) {
+      return NextResponse.json({ ok: false, error: error.message, status: getNegRiskStatus() }, { status: 409 });
+    }
     return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : String(error) }, { status: 500 });
   }
 }
