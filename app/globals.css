@@ -289,3 +289,37 @@ tr.near { background: rgba(255, 200, 107, .08); }
 .subTable table { min-width: 0; font-size: 13px; }
 .subTable th, .subTable td { padding: 8px 10px; }
 button.sm { padding: 6px 10px; font-size: 13px; border-radius: 9px; margin-right: 6px; }
+
+/* negrisk: 没查全（Σ 是下限）/ 盘口空折叠行 / 「为什么不在列表」诊断 */
+.caution { color: #ffc86b; font-weight: 900; }
+tr.groupRow td { padding: 6px 10px; background: rgba(255, 255, 255, .03); }
+button.groupToggle {
+  padding: 4px 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+button.groupToggle:hover { transform: none; text-decoration: underline; }
+.groupHint {
+  display: block;
+  margin-top: 2px;
+  max-width: min(100%, calc(100vw - 100px));
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+}
+.diagnosis {
+  margin: 12px 0;
+  padding: 14px 16px;
+  border: 1px solid rgba(255, 200, 107, .35);
+  border-radius: 14px;
+  background: rgba(255, 200, 107, .08);
+}
+.diagnosis .conclusion { margin: 6px 0 10px; font-size: 15px; font-weight: 800; line-height: 1.6; overflow-wrap: anywhere; }
+.diagnosis ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; line-height: 1.7; }
+.diagnosis li { overflow-wrap: anywhere; }

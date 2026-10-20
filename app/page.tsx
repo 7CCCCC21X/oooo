@@ -2,9 +2,21 @@
 import Link from 'next/link';
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 // 只导入类型：SWC 会把 import type 擦掉，不会把 node:fs 打进客户端包
-import type { CategoryAnalysis } from '@/lib/negrisk';
+import type { CategoryAnalysis, CategoryDiagnosis, OutcomeQuote } from '@/lib/negrisk';
 
 // ---------------- API 返回类型（只在客户端用，和各 route 的 JSON 对齐；旧版字段都按可选处理） ----------------
+
+// 进程级 predict.fun 限速器（/api/health.predictLimiter 与 /api/negrisk status.limiter 是同一个对象；旧版服务端没有）
+type PredictLimiter = {
+  rps: number | null; // null = 不限速
+  pausedForMs: number; // 收到 429 后全局暂停，剩余毫秒
+  pausedUntil: string | null;
+  count429: number;
+  last429At: string | null;
+  totalRequests: number;
+  waiting: number;
+};
+
 type HealthResponse = {
   ok: boolean;
   version: string;
@@ -17,6 +29,7 @@ type HealthResponse = {
   botLastError: string | null;
   hasTelegram: boolean;
   hasPredictApiKey?: boolean;
+  predictLimiter?: PredictLimiter | null;
   env?: string;
 };
 
@@ -49,6 +62,10 @@ type NegRiskLastCycle = {
   scanned: number;
   requests: number;
   durationMs: number;
+  capped?: boolean;
+  droppedByCap?: number;
+  failedCategories?: number;
+  retriedCategories?: number;
   hits: number;
   topSum: number | null;
   topTitle: string | null;
@@ -64,6 +81,7 @@ type NegRiskStatus = {
   timerActive: boolean;
   running: boolean;
   subscribers: number;
+  limiter?: PredictLimiter | null;
   lastCycle: NegRiskLastCycle | null;
 };
 
@@ -75,10 +93,20 @@ type ScanSummary = {
   candidates: number;
   prefiltered: number;
   scanned: number;
+  unknownEstimate?: number;
   capped: boolean;
+  droppedByCap?: number; // 超过每轮上限没轮到的类目数
   requests: number;
+  failedCategories?: number; // 补查之后仍有结果没查到的类目数
+  retriedCategories?: number; // 第一遍有失败、做了补查的类目数
   hits: number;
 };
+
+// 服务端返回的类目 / 结果：新字段（活跃数、盘口空、未查到的估计上限…）旧版服务端没有，按可选处理；
+// 进页面前经 normalizeAnalysis 补齐成 CategoryAnalysis，下面的组件只认完整类型
+type ApiOutcome = Omit<OutcomeQuote, 'spread' | 'emptyBook' | 'noValue' | 'refPrice'> & Partial<Pick<OutcomeQuote, 'spread' | 'emptyBook' | 'noValue' | 'refPrice'>>;
+type ApiCategory = Omit<CategoryAnalysis, 'activeCount' | 'emptyBooks' | 'estMissing' | 'bidSumUpper' | 'complete' | 'outcomes'> &
+  Partial<Pick<CategoryAnalysis, 'activeCount' | 'emptyBooks' | 'estMissing' | 'bidSumUpper' | 'complete'>> & { outcomes?: ApiOutcome[] };
 
 type NegRiskListResponse = {
   ok: boolean;
@@ -87,10 +115,12 @@ type NegRiskListResponse = {
   filters?: { minCents: number; limit: number };
   scan: ScanSummary;
   count: number;
-  results: CategoryAnalysis[];
+  results: ApiCategory[];
 };
+type NegRiskListData = Omit<NegRiskListResponse, 'results'> & { results: CategoryAnalysis[] };
 
-type AnalysisResponse = { ok: boolean; error?: string; status?: NegRiskStatus; analysis?: CategoryAnalysis };
+// ?slug= 的响应：analysis（实时订单簿）和 / 或 diagnosis（&why=1：这个类目为什么不在扫描列表里）
+type AnalysisResponse = { ok: boolean; error?: string; status?: NegRiskStatus; analysis?: ApiCategory; diagnosis?: CategoryDiagnosis };
 
 type PredictMarketSummary = {
   id: string;
@@ -258,6 +288,54 @@ function negriskUrl(floor: number | null) {
   return floor == null ? `/api/negrisk?limit=${NEGRISK_LIMIT}` : `/api/negrisk?min=${floor}&limit=${NEGRISK_LIMIT}`;
 }
 
+// ---------------- 兼容旧版服务端：补齐新字段 ----------------
+
+const EMPTY_BOOK_SPREAD = 30; // 与 lib/negrisk NEGRISK_EMPTY_BOOK_SPREAD 默认值一致，只在服务端没给 emptyBook 时用
+const r2 = (x: number) => Math.round(x * 100) / 100;
+const numOrNull = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+
+function normalizeOutcome(o: ApiOutcome): OutcomeQuote {
+  const bid = numOrNull(o.bid);
+  const ask = numOrNull(o.ask);
+  const spread = o.spread !== undefined ? o.spread : bid != null && ask != null ? r2(ask - bid) : null;
+  // 盘口空（lib/negrisk finishQuote 同一规则）：没买单 / 没卖单 / 价差 ≥ 30¢；获取失败的结果不算
+  const emptyBook = typeof o.emptyBook === 'boolean' ? o.emptyBook : !o.error && (bid == null || ask == null || (spread != null && spread >= EMPTY_BOOK_SPREAD));
+  return {
+    ...o,
+    bid,
+    ask,
+    bidSize: Number(o.bidSize) || 0,
+    askSize: Number(o.askSize) || 0,
+    spread,
+    emptyBook,
+    noValue: o.noValue !== undefined ? o.noValue : bid == null ? null : r2(100 - bid),
+    refPrice: o.refPrice ?? null
+  };
+}
+
+// activeCount / emptyBooks / estMissing / bidSumUpper / complete 缺失时按 lib/negrisk summarize 同一规则从结果补算
+function normalizeAnalysis(a: ApiCategory): CategoryAnalysis {
+  const outcomes = (Array.isArray(a.outcomes) ? a.outcomes : []).map(normalizeOutcome);
+  const failedOutcomes = outcomes.filter((o) => !!o.error);
+  const failed = Number(a.failed) || failedOutcomes.length;
+  const estMissing = a.estMissing ?? r2(failedOutcomes.reduce((s, o) => s + (o.refPrice == null ? 100 : Math.min(100, Math.max(0, o.refPrice))), 0));
+  const bidSum = Number(a.bidSum) || 0;
+  return {
+    ...a,
+    outcomes,
+    bidSum,
+    askSum: Number(a.askSum) || 0,
+    missingBids: Number(a.missingBids) || 0,
+    failed,
+    activeCount: a.activeCount ?? outcomes.filter((o) => !o.error && !o.emptyBook).length,
+    emptyBooks: a.emptyBooks ?? outcomes.filter((o) => !o.error && o.emptyBook).length,
+    estMissing,
+    bidSumUpper: a.bidSumUpper ?? r2(bidSum + estMissing),
+    complete: a.complete ?? failed === 0,
+    minBid: a.minBid ?? null
+  };
+}
+
 // ---------------- 纯展示组件 ----------------
 
 function StatCard({ label, value, tone, lines }: { label: string; value: ReactNode; tone?: Tone; lines: ReactNode[] }) {
@@ -331,13 +409,113 @@ function Elapsed({ since }: { since: number }) {
   return <>{Math.max(0, Math.round((now - since) / 1000))}s</>;
 }
 
-// 7 列结果表 + 脚注；口径与 lib/negrisk formatCategoryReport 一致：
-//   持「否」转换后可卖 = Σ Yes 买1 − 本结果 Yes 买1；直接卖否 = 100 − Yes 卖1
+// 8 列结果表 + 脚注；口径与 lib/negrisk formatCategoryReport 一致：
+//   持「否」转换后可卖 = Σ Yes 买1 − 本结果 Yes 买1；直接卖否 = 100 − Yes 卖1；否参考价值 = 100 − Yes 买1
+// 活跃结果按 Yes 买1 降序排前面；盘口空 / 无买单 与 未查到 的结果各折叠成一行摘要，点开才列出
+const OUTCOME_COLS = 8;
+
 function OutcomeTable({ analysis }: { analysis: CategoryAnalysis }) {
   const { outcomes, minBid, bidSum } = analysis;
+  const [showEmpty, setShowEmpty] = useState(false);
+  const [showFailed, setShowFailed] = useState(false);
   const allKeyMissing = outcomes.length > 0 && outcomes.every((o) => !!o.error && o.error.includes('Missing PREDICT_API_KEY'));
   if (allKeyMissing) return <div className="error">PREDICT_API_KEY 未配置，订单簿全部失败</div>;
+  const active = outcomes.filter((o) => !o.error && !o.emptyBook).sort((a, b) => (b.bid ?? -1) - (a.bid ?? -1));
+  const empty = outcomes.filter((o) => !o.error && o.emptyBook);
+  const failed = outcomes.filter((o) => !!o.error);
   let bottleneckMarked = false;
+
+  const quoteRow = (o: OutcomeQuote, index: number) => {
+    const convert = o.bid == null ? null : bidSum - o.bid;
+    const noBid = o.ask == null ? null : 100 - o.ask;
+    const d = convert == null || noBid == null ? null : convert - noBid;
+    const isBottleneck = !o.emptyBook && !!minBid && !bottleneckMarked && o.title === minBid.title && o.bidSize === minBid.size;
+    if (isBottleneck) bottleneckMarked = true;
+    return (
+      <tr key={`${o.id}-${index}`}>
+        <td>{index + 1}</td>
+        <td>
+          <b>{o.title}</b>
+          {isBottleneck && <span className="badge warn">瓶颈</span>}
+          <small>#{o.id}</small>
+        </td>
+        <td>
+          {o.bid == null ? (
+            <span className={o.emptyBook ? 'muted' : 'negative'}>无买单</span>
+          ) : (
+            <>
+              {fmtC(o.bid)}
+              <small>×{fmtN(o.bidSize)} 份</small>
+            </>
+          )}
+        </td>
+        <td>
+          {o.ask == null ? (
+            '-'
+          ) : (
+            <>
+              {fmtC(o.ask)}
+              <small>×{fmtN(o.askSize)} 份</small>
+            </>
+          )}
+        </td>
+        <td>{fmtC(convert)}</td>
+        {o.emptyBook ? (
+          <>
+            <td style={{ whiteSpace: 'nowrap' }}>
+              —
+              <span className="badge warn" title="没买单 / 没卖单 / 价差 ≥ 30¢：多半已淘汰或无人做市，用卖一反推「直接卖否」没有意义">
+                盘口空
+              </span>
+            </td>
+            <td>—</td>
+          </>
+        ) : (
+          <>
+            <td>{noBid == null ? '-' : fmtC(noBid)}</td>
+            <td>
+              {d == null ? (
+                '-'
+              ) : (
+                <span className={d > 0 ? 'positive' : d < 0 ? 'negative' : undefined}>
+                  {d >= 0 ? '+' : ''}
+                  {d.toFixed(1)}¢
+                </span>
+              )}
+            </td>
+          </>
+        )}
+        <td>{fmtC(o.noValue)}</td>
+      </tr>
+    );
+  };
+
+  const failedRow = (o: OutcomeQuote, index: number) => (
+    <tr key={`${o.id}-${index}`}>
+      <td>{index + 1}</td>
+      <td>
+        <b>{o.title}</b>
+        <small>#{o.id}</small>
+      </td>
+      <td colSpan={OUTCOME_COLS - 2} className="negative">
+        ❌ 订单簿未查到：{o.error}
+        {o.refPrice != null && <small className="muted">缓存参考价 {fmtC(o.refPrice)}，上限估计按它算</small>}
+      </td>
+    </tr>
+  );
+
+  // 折叠行：盘口空 / 未查到 各一行，点开才列出具体结果
+  const groupRow = (key: string, label: string, open: boolean, toggle: () => void, hint: string) => (
+    <tr key={key} className="groupRow">
+      <td colSpan={OUTCOME_COLS}>
+        <button type="button" className="groupToggle" aria-expanded={open} onClick={toggle}>
+          {label} {open ? '▾ 收起' : '▸ 展开'}
+        </button>
+        <span className="groupHint">{hint}</span>
+      </td>
+    </tr>
+  );
+
   return (
     <>
       <table>
@@ -350,72 +528,33 @@ function OutcomeTable({ analysis }: { analysis: CategoryAnalysis }) {
             <th>持「否」转换后可卖</th>
             <th>直接卖否</th>
             <th>转换优势</th>
+            <th>否参考价值</th>
           </tr>
         </thead>
         <tbody>
-          {outcomes.map((o, i) => {
-            if (o.error) {
-              return (
-                <tr key={`${o.id}-${i}`}>
-                  <td>{i + 1}</td>
-                  <td>{o.title}</td>
-                  <td colSpan={5} className="negative">❌ 订单簿获取失败：{o.error}</td>
-                </tr>
-              );
-            }
-            const convert = bidSum - (o.bid ?? 0);
-            const noBid = o.ask == null ? null : 100 - o.ask;
-            const d = noBid == null ? null : convert - noBid;
-            const isBottleneck = !!minBid && !bottleneckMarked && o.title === minBid.title && o.bidSize === minBid.size;
-            if (isBottleneck) bottleneckMarked = true;
-            return (
-              <tr key={`${o.id}-${i}`}>
-                <td>{i + 1}</td>
-                <td>
-                  <b>{o.title}</b>
-                  {isBottleneck && <span className="badge warn">瓶颈</span>}
-                  <small>#{o.id}</small>
-                </td>
-                <td>
-                  {o.bid == null ? (
-                    <span className="negative">无买单</span>
-                  ) : (
-                    <>
-                      {fmtC(o.bid)}
-                      <small>×{fmtN(o.bidSize)} 份</small>
-                    </>
-                  )}
-                </td>
-                <td>
-                  {o.ask == null ? (
-                    '-'
-                  ) : (
-                    <>
-                      {fmtC(o.ask)}
-                      <small>×{fmtN(o.askSize)} 份</small>
-                    </>
-                  )}
-                </td>
-                <td>{fmtC(convert)}</td>
-                <td>{noBid == null ? '-' : fmtC(noBid)}</td>
-                <td>
-                  {d == null ? (
-                    '-'
-                  ) : (
-                    <span className={d > 0 ? 'positive' : d < 0 ? 'negative' : undefined}>
-                      {d >= 0 ? '+' : ''}
-                      {d.toFixed(1)}¢
-                    </span>
-                  )}
-                </td>
-              </tr>
-            );
-          })}
+          {active.map(quoteRow)}
           {!outcomes.length && (
             <tr>
-              <td colSpan={7} className="empty">没有可交易的结果</td>
+              <EmptyCell colSpan={OUTCOME_COLS}>没有可交易的结果</EmptyCell>
             </tr>
           )}
+          {outcomes.length > 0 && !active.length && (
+            <tr>
+              <EmptyCell colSpan={OUTCOME_COLS}>没有盘口正常的活跃结果</EmptyCell>
+            </tr>
+          )}
+          {empty.length > 0 &&
+            groupRow('empty', `盘口空 / 无买单 ${empty.length} 个`, showEmpty, () => setShowEmpty((v) => !v), '多半已淘汰或无人做市，否的参考价值接近 100¢，别拿它们的否去转换')}
+          {showEmpty && empty.map((o, i) => quoteRow(o, active.length + i))}
+          {failed.length > 0 &&
+            groupRow(
+              'failed',
+              `未查到 ${failed.length} 个`,
+              showFailed,
+              () => setShowFailed((v) => !v),
+              `订单簿没查到（多半是 429 限流），按 0 计，Σ 是下限，最多再 +${analysis.estMissing.toFixed(1)}¢`
+            )}
+          {showFailed && failed.map((o, i) => failedRow(o, active.length + empty.length + i))}
         </tbody>
       </table>
       <small className="muted" style={{ display: 'block', marginTop: 8, lineHeight: 1.6 }}>
@@ -431,19 +570,21 @@ function OutcomeTable({ analysis }: { analysis: CategoryAnalysis }) {
         )}
         {analysis.failed > 0 && (
           <>
-            订单簿获取失败: {analysis.failed} 个（按 0 计，总和偏低）<br />
+            未查到订单簿: {analysis.failed} 个（按 0 计，Σ 是下限，最多再 +{analysis.estMissing.toFixed(1)}¢）<br />
           </>
         )}
-        Yes买1 ×深度 · Yes卖1 · 持「否」转换后可卖 / 直接卖否 — 与 Telegram 报告同口径
+        Yes买1 ×深度 · Yes卖1 · 持「否」转换后可卖 / 直接卖否 · 否参考价值 — 与 Telegram 报告同口径
       </small>
     </>
   );
 }
 
-// formatCategoryReport 的 4 行表头
+// formatCategoryReport 的 4 行表头：没查全时 Σ 是下限，判定多一档「❓ 可能达到，需重查」（上限估计 ≥ 阈值）
 function CategoryHeader({ analysis: a, thresholdCents }: { analysis: CategoryAnalysis; thresholdCents: number }) {
   const edge = a.bidSum - 100;
   const hit = a.bidSum >= thresholdCents;
+  const maybe = !hit && a.failed > 0 && a.bidSumUpper >= thresholdCents;
+  const verdict = hit ? '✅ 达到' : maybe ? '❓ 可能达到，需重查' : '❌ 未达到';
   return (
     <div style={{ lineHeight: 1.7, marginBottom: 6 }}>
       <div>
@@ -455,12 +596,16 @@ function CategoryHeader({ analysis: a, thresholdCents }: { analysis: CategoryAna
         <NegRiskBadge negRisk={a.negRisk} />
       </div>
       <div className="muted">
-        可转换(NegRisk): {a.negRisk === true ? '是' : a.negRisk === false ? '否' : '未知'} · {a.outcomeCount} 个结果（可交易 {a.tradeableCount}）
+        {`可转换(NegRisk): ${a.negRisk === true ? '是' : a.negRisk === false ? '否' : '未知'} · ${a.outcomeCount} 个结果（可交易 ${a.tradeableCount} · 活跃 ${a.activeCount}${
+          a.emptyBooks ? ` · 盘口空 ${a.emptyBooks}` : ''
+        }${a.failed ? ` · 未查到 ${a.failed}` : ''}）`}
       </div>
       <div>
-        <span className={hit ? 'positive' : 'negative'}>{`Σ Yes 买1 = ${fmtC(a.bidSum)}（阈值 ${fmtC(thresholdCents)} → ${hit ? '✅ 达到' : '❌ 未达到'}）`}</span>
+        <span className={hit ? 'positive' : maybe ? 'caution' : 'negative'}>
+          {`Σ Yes 买1 ${a.failed ? '≥' : '='} ${fmtC(a.bidSum)}${a.failed ? `（${a.failed} 个结果未查到，最多再 +${a.estMissing.toFixed(1)}¢）` : ''}（阈值 ${fmtC(thresholdCents)} → ${verdict}）`}
+        </span>
       </div>
-      <div className="muted">{`Σ Yes 卖1 = ${fmtC(a.askSum)} · 转换套利每份 ≈ ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}¢（未扣手续费）`}</div>
+      <div className="muted">{`活跃结果 Σ Yes 卖1 = ${fmtC(a.askSum)} · 转换套利每份 ≈ ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}¢（未扣手续费）`}</div>
       {a.negRisk === false && <div className="error">⚠️ 接口标记这个类目不是 NegRisk，否 不能转换成 Yes</div>}
       <div className="muted">检查于 {fmtTime(a.checkedAt)}</div>
     </div>
@@ -480,15 +625,22 @@ type CategoryRowProps = {
 
 function CategoryRow({ row, thresholdCents, expanded, requoting, rowError, skewMs, onToggle, onRequote }: CategoryRowProps) {
   const hit = row.bidSum >= thresholdCents;
+  const incomplete = row.failed > 0; // 没查全：bidSum 只是下限，真实总和 ≤ bidSumUpper
+  const maybeHit = !hit && incomplete && row.bidSumUpper >= thresholdCents;
   const edge = row.bidSum - 100;
-  const allFailed = row.failed > 0 && row.failed === row.outcomes.length;
-  const qualityOk = row.missingBids === 0 && row.failed === 0;
+  const allFailed = incomplete && row.failed === row.outcomes.length;
+  const qualityOk = row.missingBids === 0 && !incomplete;
+  const upperHint = `最多再 +${row.estMissing.toFixed(1)}¢`;
   return (
     <>
       <tr className={hit ? 'hit' : 'near'}>
         <td>
           {hit ? (
             <span className="positive" style={{ whiteSpace: 'nowrap' }}>✅ 达标</span>
+          ) : maybeHit ? (
+            <span className="caution" style={{ whiteSpace: 'nowrap' }} title={`没查全：上限估计 ${fmtC(row.bidSumUpper)} ≥ 阈值，点「重新查」确认`}>
+              ❓ 可能达标
+            </span>
           ) : (
             <span className="muted" style={{ whiteSpace: 'nowrap' }}>▫️ 接近</span>
           )}
@@ -502,23 +654,28 @@ function CategoryRow({ row, thresholdCents, expanded, requoting, rowError, skewM
         <td>
           {allFailed ? (
             <>
-              —<small className="negative">全部获取失败</small>
+              —<small className="negative">全部未查到</small>
             </>
           ) : (
             <>
-              <b className={hit ? 'positive' : undefined}>{row.bidSum.toFixed(1)}¢</b>
+              <b className={hit ? 'positive' : undefined} style={{ whiteSpace: 'nowrap' }} title={incomplete ? `下限：${row.failed} 个结果未查到，${upperHint}` : undefined}>
+                {incomplete ? '≥ ' : ''}
+                {row.bidSum.toFixed(1)}¢
+              </b>
               <small>
-                每份 ≈ {edge >= 0 ? '+' : ''}
+                每份 {incomplete ? '≥' : '≈'} {edge >= 0 ? '+' : ''}
                 {edge.toFixed(1)}¢
               </small>
-              {row.failed > 0 && <small className="negative">总和偏低</small>}
+              {incomplete && <small className="caution">下限 · {upperHint}</small>}
             </>
           )}
         </td>
-        <td>{row.askSum.toFixed(1)}¢</td>
         <td>
-          {row.tradeableCount} / {row.outcomeCount}
-          <small>可交易 / 共</small>
+          {row.askSum.toFixed(1)}¢<small>活跃结果</small>
+        </td>
+        <td>
+          {row.activeCount} / {row.tradeableCount} / {row.outcomeCount}
+          <small>活跃 / 可交易 / 共</small>
         </td>
         <td>
           {row.minBid ? (
@@ -540,9 +697,9 @@ function CategoryRow({ row, thresholdCents, expanded, requoting, rowError, skewM
                   无买单 {row.missingBids}
                 </span>
               )}
-              {row.failed > 0 && (
-                <span className="badge bad" title="按 0 计，总和偏低">
-                  ❌ 失败 {row.failed}
+              {incomplete && (
+                <span className="badge warn" title={`订单簿没查到（多半是 429 限流），按 0 计，Σ 是下限；${upperHint}`}>
+                  未查到 {row.failed}
                 </span>
               )}
             </>
@@ -578,12 +735,49 @@ function CategoryRow({ row, thresholdCents, expanded, requoting, rowError, skewM
   );
 }
 
+// /api/negrisk?slug=…&why=1&live=0 的结果：结论放大，其余事实一行一条（措辞与 lib/negrisk formatDiagnosis 一致）
+function DiagnosisPanel({ d }: { d: CategoryDiagnosis }) {
+  const facts: string[] = [];
+  facts.push(d.cacheReady ? `缓存: ${d.inCache ? '有' : '无'}这个类目 · 抓取于 ${fmtTime(d.cacheFetchedAt)}（${d.cacheComplete ? '完整' : '不完整'}）` : '缓存: 未就绪');
+  if (d.inCache) {
+    facts.push(
+      `市场: ${d.marketsInCache} 个（可交易 ${d.tradeableInCache}）· 判定方式 ${d.detectMode === 'flag' ? '接口 isNegRisk' : '启发式'} · 带标记 ${d.flaggedMarkets} 个 → 可转换: ${d.convertible ? '是' : '否'}`
+    );
+    if (d.cutoff != null) {
+      facts.push(`预过滤: 参考价之和 ${d.estimate == null ? '无（缺参考价，优先扫）' : fmtC(d.estimate)} vs 下限 ${fmtC(d.cutoff)} → ${d.prefiltered ? '跳过' : '不跳过'}`);
+    }
+    if (d.rank != null) facts.push(`队列: 第 ${d.rank}/${d.queueLength ?? '-'} 位 · 每轮上限 ${d.maxCategories ?? '-'} → ${d.capped ? '这轮没轮到' : '在本轮内'}`);
+  }
+  const ls = d.lastScan ?? null;
+  facts.push(
+    ls
+      ? ls.scanned
+        ? `上次扫描 ${fmtTime(ls.at)}: Σ ${ls.failed ? '≥ ' : ''}${fmtC(ls.bidSum)}（未查到 ${ls.failed ?? 0}，上限 ${fmtC(ls.bidSumUpper)}，活跃 ${ls.activeCount ?? '-'}）→ ${
+            ls.passesFloor ? '在列表里' : '低于显示下限'
+          }`
+        : `上次扫描 ${fmtTime(ls.at)}: 没有这个类目`
+      : '上次扫描: 还没有'
+  );
+  facts.push(`阈值 ${d.thresholdCents}¢ · 显示下限 ${d.displayMinCents}¢`);
+  return (
+    <div className="diagnosis">
+      <div className="muted" style={{ fontSize: 13 }}>🔎 {d.slug || '-'} · 为什么不在列表？</div>
+      <p className="conclusion">{d.conclusion || '（服务端没给结论）'}</p>
+      <ul>
+        {facts.map((f, i) => (
+          <li key={i}>{f}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 // ---------------- 页面 ----------------
 
 export default function DashboardPage() {
   const [health, setHealth] = useState<{ data: HealthResponse | null; error: string }>({ data: null, error: '' });
   const [cache, setCache] = useState<{ data: CacheStatus | null; error: string }>({ data: null, error: '' });
-  const [negrisk, setNegrisk] = useState<{ data: NegRiskListResponse | null; status: NegRiskStatus | null; error: string; notScanned: boolean }>({
+  const [negrisk, setNegrisk] = useState<{ data: NegRiskListData | null; status: NegRiskStatus | null; error: string; notScanned: boolean }>({
     data: null,
     status: null,
     error: '',
@@ -610,6 +804,10 @@ export default function DashboardPage() {
   // 单类目结果连同响应里的「当前阈值」一起存：bot 的 /yes 按当前阈值判定，不是上次扫描时的阈值
   const [analysis, setAnalysis] = useState<{ analysis: CategoryAnalysis; thresholdCents: number } | null>(null);
   const [analyzeError, setAnalyzeError] = useState('');
+  // 「为什么不在列表？」：只诊断不查订单簿（/api/negrisk?slug=…&why=1&live=0，与 bot 的 /yes_why 同口径）
+  const [diagnosing, setDiagnosing] = useState(false);
+  const [diagnosis, setDiagnosis] = useState<CategoryDiagnosis | null>(null);
+  const [diagnoseError, setDiagnoseError] = useState('');
 
   const floorRef = useRef<number | null>(null);
   const scanningRef = useRef(false);
@@ -627,7 +825,7 @@ export default function DashboardPage() {
     const json = r.json;
     let applied = true;
     if (r.ok && json && Array.isArray(json.results)) {
-      setNegrisk({ data: json, status: json.status, error: '', notScanned: false });
+      setNegrisk({ data: { ...json, results: json.results.map(normalizeAnalysis) }, status: json.status, error: '', notScanned: false });
     } else if (r.status === 404 && json?.status) {
       setNegrisk({ data: null, status: json.status, error: '', notScanned: true });
     } else {
@@ -835,9 +1033,23 @@ export default function DashboardPage() {
     const r = await fetchAnalysis(input);
     if (r.ok && r.json?.analysis) {
       // 阈值用响应里的当前设置：与 bot /yes 的 formatCategoryReport(a, getNegRiskThreshold()) 同口径
-      setAnalysis({ analysis: r.json.analysis, thresholdCents: r.json.status?.thresholdCents ?? negrisk.status?.thresholdCents ?? 100 });
+      setAnalysis({ analysis: normalizeAnalysis(r.json.analysis), thresholdCents: r.json.status?.thresholdCents ?? negrisk.status?.thresholdCents ?? 100 });
     } else setAnalyzeError(r.error || '查询失败');
     setAnalyzing(false);
+  }
+
+  // 只问「为什么不在列表」：live=0 不碰订单簿，响应里只有 diagnosis
+  async function diagnose() {
+    const input = analyzeInput.trim();
+    if (!input || diagnosing) return;
+    setDiagnosing(true);
+    setDiagnosis(null);
+    setDiagnoseError('');
+    const r = await getJson<AnalysisResponse>(`/api/negrisk?slug=${encodeURIComponent(input)}&why=1&live=0`, 20000);
+    if (!mountedRef.current) return;
+    if (r.ok && r.json?.diagnosis) setDiagnosis(r.json.diagnosis);
+    else setDiagnoseError(r.ok ? '服务端没有返回诊断（旧版本不支持 ?why=1，请升级后台）' : `诊断失败：${r.error || '未知错误'}`);
+    setDiagnosing(false);
   }
 
   // 每行「重新查」：同一个接口，结果放进 liveRows（checkedAt 更新的才覆盖扫描行）
@@ -851,7 +1063,7 @@ export default function DashboardPage() {
     });
     const r = await fetchAnalysis(slug);
     if (r.ok && r.json?.analysis) {
-      const a = r.json.analysis;
+      const a = normalizeAnalysis(r.json.analysis);
       setLiveRows((prev) => ({ ...prev, [slug]: a }));
     } else {
       setRowErrors((prev) => ({ ...prev, [slug]: r.error || '查询失败' }));
@@ -930,7 +1142,9 @@ export default function DashboardPage() {
     if (h?.env && h.env !== 'production') warnings.push('开发模式：instrumentation 不启动后台任务；用「重新抓取市场缓存」和「立即重扫」手动填充');
     if (c?.lastError) warnings.push(`缓存错误：${c.lastError}`);
     if (c && c.complete === false) warnings.push(`市场缓存不完整（${c.pagesFetched} 页，stop=${c.stoppedReason ?? '-'}），NegRisk 候选与 PP 列表可能漏`);
-    if (negrisk.data?.scan.capped) warnings.push('本轮扫描达到 NEGRISK_SCAN_MAX_CATEGORIES 上限，部分类目未查');
+    const sc = negrisk.data?.scan;
+    if (sc?.capped) warnings.push(`本轮扫描超过 NEGRISK_SCAN_MAX_CATEGORIES 每轮上限${sc.droppedByCap != null ? `，截掉 ${sc.droppedByCap} 个类目没查` : '，部分类目未查'}`);
+    if (sc?.failedCategories) warnings.push(`${sc.failedCategories} 个类目有结果的订单簿没查到（多半是 429 限流），这些行的 Σ Yes 买1 只是下限（标 ≥），点「重新查」补齐`);
     if (negrisk.status && negrisk.status.enabled === false) warnings.push('NegRisk 提醒已关闭（/yes_on 开启），扫描仍在跑');
     if (h?.botLastError) warnings.push(`Bot 错误：${h.botLastError}`);
     return { errors, warnings };
@@ -1041,6 +1255,19 @@ export default function DashboardPage() {
           h.hasPredictApiKey !== undefined ? ` · PREDICT_API_KEY ${h.hasPredictApiKey ? '已配置' : '未配置'}` : ''
         }`
       );
+      // 进程级 predict.fun 限速器（旧版服务端没有这个字段）
+      const lim = h.predictLimiter;
+      if (lim) {
+        lines.push(
+          `predict.fun 限速 ${lim.rps == null ? '不限' : `${lim.rps}/s`} · 429 共 ${lim.count429 ?? 0} 次${
+            lim.last429At ? `（最近 ${fmtClock(lim.last429At)}，${ago(lim.last429At)}）` : ''
+          } · 请求 ${fmtN(lim.totalRequests)}${lim.waiting ? ` · 排队 ${lim.waiting}` : ''}`
+        );
+        if (lim.pausedForMs > 0) {
+          lines.push(<span className="caution">⏸ 限流暂停中，剩 {Math.ceil(lim.pausedForMs / 1000)}s</span>);
+          if (tone !== 'bad') tone = 'warn';
+        }
+      }
       if (h.botLastError) lines.push(<span className="negative">{h.botLastError}</span>);
     }
     return { value, tone, lines };
@@ -1138,7 +1365,9 @@ export default function DashboardPage() {
               <>
                 判定 {scan.detectMode === 'flag' ? '接口 isNegRisk 字段' : '启发式（≥3 个结果，接口没给 isNegRisk）'} · 扫描于 {fmtClock(scan.checkedAt)}（{ago(scan.checkedAt)}）
                 {lastCycle?.manual ? ' · 手动扫描' : ''}
-                {scan.capped ? ' · ⚠️ 已达扫描上限' : ''}
+                {scan.capped && <span className="caution"> · ⚠️ 超每轮上限{scan.droppedByCap != null ? `，截掉 ${scan.droppedByCap} 个` : ''}</span>}
+                {(scan.failedCategories ?? 0) > 0 && ` · ${scan.failedCategories} 个类目有结果未查到`}
+                {(scan.retriedCategories ?? 0) > 0 && ` · 补查 ${scan.retriedCategories} 个`}
               </>
             )}
           </p>
@@ -1211,7 +1440,10 @@ export default function DashboardPage() {
       <section className="card resolverCard" id="analyze">
         <div className="sectionHeader">
           <h2>查单个类目</h2>
-          <p>粘贴 predict.fun 链接或 slug，实时查该类目每个结果的 Yes 买1/卖1（与 bot 的 /yes 报告同口径，会发 N 个订单簿请求）</p>
+          <p>
+            粘贴 predict.fun 链接或 slug，实时查该类目每个结果的 Yes 买1/卖1（与 bot 的 /yes 报告同口径，会发 N 个订单簿请求）；「为什么不在列表？」只看扫描诊断，不查订单簿（同
+            /yes_why）
+          </p>
         </div>
         <div className="resolverRow">
           <input
@@ -1227,13 +1459,24 @@ export default function DashboardPage() {
           <button onClick={() => void analyze()} disabled={analyzing || !analyzeInput.trim()}>
             {analyzing ? '查询中...' : '查询'}
           </button>
+          <button
+            className="secondary"
+            onClick={() => void diagnose()}
+            disabled={diagnosing || !analyzeInput.trim()}
+            title="只解释后台扫描为什么没列出它（与 bot 的 /yes_why 同口径），不查订单簿"
+          >
+            {diagnosing ? '诊断中...' : '为什么不在列表？'}
+          </button>
         </div>
         {analyzeError && <div className="error">{analyzeError}</div>}
+        {diagnoseError && <div className="error">{diagnoseError}</div>}
+        {diagnosis && <DiagnosisPanel d={diagnosis} />}
         {analysis && (
           <>
             <CategoryHeader analysis={analysis.analysis} thresholdCents={analysis.thresholdCents} />
             <div className="subTable">
-              <OutcomeTable analysis={analysis.analysis} />
+              {/* key：换一个类目 / 重新查询时折叠状态归零 */}
+              <OutcomeTable key={`${analysis.analysis.slug}-${analysis.analysis.checkedAt}`} analysis={analysis.analysis} />
             </div>
           </>
         )}
