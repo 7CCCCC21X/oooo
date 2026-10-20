@@ -24,13 +24,20 @@
 - 后台每 `NEGRISK_CHECK_INTERVAL_MS`（默认 5 分钟）扫一遍，总和 ≥ 阈值的类目推送到 `/subscribe_yes` 订阅的话题（没订阅就发 `TELEGRAM_CHAT_ID` + `TELEGRAM_THREAD_ID`）；消息末尾附带"接近阈值"的类目（显示下限 ≤ 总和 < 提醒阈值，最多 5 个）。手动扫描期间恰好到点的后台扫描会跳过该轮。
 - 阈值默认 100¢，`/yes_threshold 101` 随时改（持久化到 `NEGRISK_STATE_FILE`）；`/yes_off` `/yes_on` 开关。
 - 是否可转换按接口的 `isNegRisk` / `negRiskOnChainId` 判断；接口没给这些字段时退化为"≥3 个结果的类目"。
+- 盘口空的结果（没买单、没卖单、或卖一 − 买一 ≥ `NEGRISK_EMPTY_BOOK_SPREAD`，默认 30¢）多半已淘汰：报告里单独归为一组，不算"活跃"，不参与"直接卖否"比较；"否参考价值 = 100 − Yes 买1"提示持有者不要拿它们去转换。
+- 扫描时某个结果的订单簿没查到（通常是 429），先补查一次；仍没查到的类目总和显示为"≥ X"（下限），只要上限估计 ≥ 显示下限就照样列出，不再静默漏掉。
+- `/yes_why <链接>`（或 `GET /api/negrisk?slug=<链接>&why=1&live=0`）：解释某个类目为什么不在扫描列表里——不在缓存、未判定为可转换、被预过滤、排队超过每轮上限、上次扫描结果低于下限或没查全。
+
+## 请求限速
+
+所有走 `fetchJson` 的 `api.predict.fun` 请求共用一个进程级令牌桶（`PREDICT_RATE_LIMIT_RPS`，默认每秒 5 个），缓存抓取、可转换扫描、网页查询和 bot 命令排队而不是各自突发。收到 429 时全部请求暂停 `PREDICT_429_PAUSE_MS`（默认 20 秒，接口给 Retry-After 时取较大者），暂停结束后该请求自动重试 `PREDICT_429_RETRIES` 次。`/status` 和 `/api/health` 的 `predictLimiter` 能看到 429 次数和是否在暂停中。
 
 ## 市场抓取与筛选
 
 数据来自 `/v1/categories`（市场嵌在 category 里），抓取规则：
 
 - 默认带 `status=OPEN` 让服务端过滤掉已结算类目（`PREDICT_CATEGORY_STATUS`，设 `none` 全量抓）；接口拒绝该参数或返回空时自动退回全量。
-- 单页 429/5xx/超时 会指数退避重试（`PREDICT_FETCH_RETRIES`，默认 4 次）。
+- 单页 5xx/超时 会指数退避重试（`PREDICT_FETCH_RETRIES`，默认 4 次）；429 由限速器统一暂停重试。
 - 翻页到 `PREDICT_CACHE_MAX_PAGES`（默认 500）或中途报错时标记为「不完整」，看板、bot 列表头部和 `/status` 会提示；不完整且比上一份缓存少很多时不覆盖旧缓存。
 
 筛选口径（bot `/predict_only`、订阅推送、`/api/predict-only`、看板共用 `selectEligibleMarkets`）：

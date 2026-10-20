@@ -641,13 +641,14 @@ export function isCompleteStop(stoppedReason: string): boolean {
 }
 
 function isRetryableFetchError(msg: string): boolean {
-  if (/HTTP 4\d\d/.test(msg) && !/HTTP 429/.test(msg)) return false; // 4xx（除 429）不重试
-  return true; // 429 / 5xx / 超时 / 网络断 都重试
+  // 429 由 fetch-json 里的限速器统一处理（全局暂停 + 重试），到这里还失败说明限流持续，不再叠加重试
+  if (/HTTP 4\d\d/.test(msg)) return false;
+  return true; // 5xx / 超时 / 网络断 重试
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// 带重试的单页抓取：429/5xx/超时 最多重试 PREDICT_FETCH_RETRIES 次（默认 4），指数退避
+// 带重试的单页抓取：5xx/超时 最多重试 PREDICT_FETCH_RETRIES 次（默认 4），指数退避；429 见 fetch-json
 async function fetchPageWithRetry(url: string, headers: Record<string, string>) {
   const maxAttempts = 1 + (Number(process.env.PREDICT_FETCH_RETRIES) || 4);
   let lastErr: unknown;

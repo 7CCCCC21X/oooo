@@ -1,7 +1,9 @@
 import { getActiveExcludeKeywords, predictMarketUrl, selectEligibleGroups } from './predict-markets';
 import {
   analyzeCategoryBySlugOrUrl,
+  diagnoseCategory,
   formatCategoryReport,
+  formatDiagnosis,
   formatScanReport,
   getNegRiskDisplayMin,
   getNegRiskStatus,
@@ -430,11 +432,17 @@ async function handleStatus(chatId: number | string, threadId: number | null) {
       `上次扫描: ${c.at} · 候选 ${c.candidates} / 预过滤 ${c.prefiltered} / 查询 ${c.scanned} · ${c.requests} 次请求 ${Math.round(c.durationMs / 1000)}s · 达标 ${c.hits} · 已推送 ${c.alertsSent}`
     );
     if (c.topSum != null) lines.push(`最高: ${c.topSum.toFixed(1)}¢ ${c.topTitle}`);
+    if (c.capped) lines.push(`⚠️ 超每轮上限，截掉 ${c.droppedByCap} 个类目没查（调大 NEGRISK_SCAN_MAX_CATEGORIES）`);
+    if (c.retriedCategories) lines.push(`补查 ${c.retriedCategories} 个类目${c.failedCategories ? `，仍有 ${c.failedCategories} 个有结果未查到` : '，全部补齐'}`);
     if (c.detectMode) lines.push(`判定: ${c.detectMode === 'flag' ? '接口 isNegRisk' : '启发式(≥3 结果)'}`);
     if (c.error) lines.push(`扫描错误: ${c.error}`);
   } else {
     lines.push('上次扫描: (尚未)');
   }
+  const lim = nr.limiter;
+  lines.push(
+    `predict.fun 限速: ${lim.rps == null ? '关闭' : `${lim.rps}/s`} · 已发 ${lim.totalRequests} 次 · 429 共 ${lim.count429} 次${lim.last429At ? `（最近 ${lim.last429At}）` : ''}${lim.pausedForMs ? ` · ⏸ 暂停中，剩 ${Math.ceil(lim.pausedForMs / 1000)}s` : ''}`
+  );
   if (globalThis.__tgBotLastError) lines.push(`Bot 错误: ${globalThis.__tgBotLastError}`);
   await reply(chatId, threadId, lines.join('\n'));
 }
@@ -468,6 +476,19 @@ function parseFloorArg(args: string[]): { minCents: number; error?: string } {
   const n = Number(raw.replace(/[¢%,，]/g, ''));
   if (!Number.isFinite(n) || n < 0 || n > 1000) return { minCents: getNegRiskDisplayMin(), error: `下限无效: ${args[0]}（要 0-1000 的数字，单位 ¢，或 all）` };
   return { minCents: n };
+}
+
+async function handleYesWhy(chatId: number | string, threadId: number | null, input: string) {
+  const target = (input || '').trim();
+  if (!target) {
+    await reply(chatId, threadId, '用法: /yes_why <predict.fun 链接或 slug>\n回答这个类目为什么不在 /yes_check 列表里（缓存、可转换判定、预过滤、每轮上限、上次扫描结果）。');
+    return;
+  }
+  try {
+    await replyLong(chatId, threadId, formatDiagnosis(diagnoseCategory(target)));
+  } catch (err) {
+    await reply(chatId, threadId, `❌ 诊断失败: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 async function handleYesCheck(chatId: number | string, threadId: number | null, args: string[] = []) {
@@ -552,6 +573,7 @@ async function handleHelp(chatId: number | string, threadId: number | null) {
     '/yes <链接> - 查该类目所有结果的 Yes 买1 并求和（直接发链接也行）',
     '/yes_check [下限|all] - 扫描全部可转换类目，列出 Yes 买1 总和 ≥ 下限的（低于提醒阈值的也显示）',
     '/yes_show [下限] - 查看/设置默认显示下限（¢，默认 95）',
+    '/yes_why <链接> - 某类目为什么不在扫描列表里（缓存/判定/预过滤/上限/上次扫描）',
     '/yes_threshold [数值] - 查看/设置提醒阈值（¢，默认 100）',
     '/yes_on /yes_off - 开关 Yes 总和提醒',
     '/subscribe_yes - 本话题订阅 Yes 总和提醒',
@@ -608,6 +630,11 @@ async function handleCommand(
     case '/yescheck':
     case '/negrisk_check':
       await handleYesCheck(chatId, threadId, args);
+      return;
+    case '/yes_why':
+    case '/yeswhy':
+    case '/why':
+      await handleYesWhy(chatId, threadId, args.join(' '));
       return;
     case '/yes_show':
     case '/yesshow':
@@ -750,6 +777,7 @@ async function registerCommandsMenu() {
         { command: 'yes', description: '查链接类目的 Yes 买1 总和' },
         { command: 'yes_check', description: '扫描可转换类目 Yes 买1 总和（可带下限）' },
         { command: 'yes_show', description: '查看/设置显示下限' },
+        { command: 'yes_why', description: '某类目为何不在扫描列表' },
         { command: 'yes_threshold', description: '查看/设置 Yes 总和提醒阈值' },
         { command: 'subscribe_yes', description: '订阅 Yes 总和提醒' },
         { command: 'subscribe', description: '订阅 Predict 独有新市场' },

@@ -17,7 +17,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { envNumber } from './env';
 import { fetchJson } from './fetch-json';
-import { getCachedMarkets } from './predict-cache';
+import { getCachedMarkets, type MarketsCacheEntry } from './predict-cache';
+import { getPredictLimiterStatus } from './predict-limiter';
 import { groupMarketsByCategory, normalizeCategoryMarkets, predictMarketUrl, type MarketGroup } from './predict-markets';
 import { extractPredictSlug } from './predict-url';
 import { getPredictYesBook } from './orderbooks';
@@ -35,6 +36,12 @@ export type OutcomeQuote = {
   bidSize: number;
   ask: number | null; // Yes 卖一（¢）
   askSize: number;
+  spread: number | null; // 卖一 − 买一（¢）
+  // 盘口空：没买单 / 没卖单 / 价差 ≥ NEGRISK_EMPTY_BOOK_SPREAD（默认 30¢）。多半是已淘汰或无人做市，
+  // 用它的卖一反推"直接卖否"没有意义，持有的否也不该拿去转换。
+  emptyBook: boolean;
+  noValue: number | null; // 否 的参考价值 = 100 − Yes 买一
+  refPrice: number | null; // 缓存里的参考价（¢），订单簿获取失败时用它估计
   error?: string;
 };
 
@@ -45,11 +52,16 @@ export type CategoryAnalysis = {
   negRisk: boolean | null; // null = 接口没给 isNegRisk / negRiskOnChainId，无法判断
   outcomeCount: number;
   tradeableCount: number;
+  activeCount: number; // 有买单且盘口不空的结果数
   outcomes: OutcomeQuote[]; // 只含可交易的结果，按 Yes 买一降序
-  bidSum: number; // Σ Yes 买一（¢），没买单/获取失败按 0 计
-  askSum: number; // Σ Yes 卖一（¢）
+  bidSum: number; // Σ Yes 买一（¢），没买单/获取失败按 0 计 —— 是下限
+  askSum: number; // 活跃结果的 Σ Yes 卖一（¢）
   missingBids: number;
-  failed: number;
+  emptyBooks: number;
+  failed: number; // 订单簿获取失败的结果数
+  estMissing: number; // 获取失败的结果按参考价估计的买一之和（没参考价按 100）
+  bidSumUpper: number; // bidSum + estMissing：真实总和不会超过这个
+  complete: boolean; // failed === 0
   minBid: { size: number; title: string } | null;
   checkedAt: string;
 };
@@ -61,10 +73,13 @@ export type ScanResult = {
   thresholdCents: number;
   candidates: number;
   prefiltered: number;
+  unknownEstimate: number; // 缓存里没参考价、无法预过滤的类目数（优先扫）
   scanned: number;
   capped: boolean;
+  droppedByCap: number; // 超过每轮上限没轮到的类目数
   requests: number;
-  failedCategories: number;
+  failedCategories: number; // 补查之后仍有结果没查到的类目数
+  retriedCategories: number; // 第一遍有失败、做了补查的类目数
   results: CategoryAnalysis[]; // bidSum 降序
   hits: CategoryAnalysis[]; // bidSum ≥ 阈值
 };
@@ -237,6 +252,7 @@ export function getNegRiskStatus() {
     timerActive: !!globalThis.__negRiskTimer,
     running: !!globalThis.__negRiskRunning,
     subscribers: getSubscriptions('negrisk').length,
+    limiter: getPredictLimiterStatus(),
     lastCycle: last
       ? {
           at: last.at,
@@ -249,6 +265,10 @@ export function getNegRiskStatus() {
           scanned: last.scan?.scanned ?? 0,
           requests: last.scan?.requests ?? 0,
           durationMs: last.scan?.durationMs ?? 0,
+          capped: last.scan?.capped ?? false,
+          droppedByCap: last.scan?.droppedByCap ?? 0,
+          failedCategories: last.scan?.failedCategories ?? 0,
+          retriedCategories: last.scan?.retriedCategories ?? 0,
           hits: last.scan?.hits.length ?? 0,
           topSum: last.scan?.results[0]?.bidSum ?? null,
           topTitle: last.scan?.results[0]?.title ?? null
@@ -279,66 +299,117 @@ function isConvertibleGroup(g: MarketGroup, mode: 'flag' | 'heuristic'): boolean
 
 // ---------------- 单个类目分析 ----------------
 
-async function quoteOutcome(m: PredictMarketSummary): Promise<OutcomeQuote> {
-  const base: OutcomeQuote = {
-    id: m.id,
-    title: m.title || m.question || m.id,
-    questionIndex: m.questionIndex,
-    bid: null,
-    bidSize: 0,
-    ask: null,
-    askSize: 0
+type OutcomeRef = { id: string; title: string; questionIndex?: number; refPrice: number | null };
+
+function outcomeRef(m: PredictMarketSummary): OutcomeRef {
+  return { id: m.id, title: m.title || m.question || m.id, questionIndex: m.questionIndex, refPrice: toCents(m.yesPrice ?? null) };
+}
+
+function emptyBookSpread(): number {
+  return envNumber('NEGRISK_EMPTY_BOOK_SPREAD', 30);
+}
+
+function finishQuote(ref: OutcomeRef, book: TopBook): OutcomeQuote {
+  const bid = toCents(book.bid?.price ?? null);
+  const ask = toCents(book.ask?.price ?? null);
+  const spread = bid != null && ask != null ? Math.round((ask - bid) * 100) / 100 : null;
+  const emptyBook = bid == null || ask == null || (spread != null && spread >= emptyBookSpread());
+  return {
+    ...ref,
+    bid,
+    bidSize: book.bid?.size ?? 0,
+    ask,
+    askSize: book.ask?.size ?? 0,
+    spread,
+    emptyBook,
+    noValue: bid == null ? null : Math.round((100 - bid) * 100) / 100
   };
+}
+
+async function quoteOutcome(ref: OutcomeRef): Promise<OutcomeQuote> {
   try {
-    const book: TopBook = await getPredictYesBook(m.id);
-    return {
-      ...base,
-      bid: toCents(book.bid?.price ?? null),
-      bidSize: book.bid?.size ?? 0,
-      ask: toCents(book.ask?.price ?? null),
-      askSize: book.ask?.size ?? 0
-    };
+    const book: TopBook = await getPredictYesBook(ref.id);
+    return finishQuote(ref, book);
   } catch (err) {
-    return { ...base, error: err instanceof Error ? err.message : String(err) };
+    return { ...ref, bid: null, bidSize: 0, ask: null, askSize: 0, spread: null, emptyBook: false, noValue: null, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
-export async function analyzeMarkets(
-  info: { slug: string; title: string; url: string; negRisk: boolean | null },
-  markets: PredictMarketSummary[],
-  options: { concurrency?: number } = {}
-): Promise<CategoryAnalysis> {
-  const tradeable = markets.filter((m) => m.tradeable);
-  const concurrency = options.concurrency ?? envNumber('NEGRISK_SCAN_CONCURRENCY', 4);
-  const outcomes = await mapLimit(tradeable, concurrency, quoteOutcome);
+type CategoryInfo = { slug: string; title: string; url: string; negRisk: boolean | null };
+
+function summarize(info: CategoryInfo, outcomes: OutcomeQuote[], outcomeCount: number, tradeableCount: number): CategoryAnalysis {
   outcomes.sort((a, b) => (b.bid ?? -1) - (a.bid ?? -1));
   let bidSum = 0;
   let askSum = 0;
   let missingBids = 0;
+  let emptyBooks = 0;
   let failed = 0;
+  let activeCount = 0;
+  let estMissing = 0;
   let minBid: { size: number; title: string } | null = null;
   for (const o of outcomes) {
-    if (o.error) failed += 1;
-    else if (o.bid == null) missingBids += 1;
+    if (o.error) {
+      failed += 1;
+      estMissing += o.refPrice == null ? 100 : Math.min(100, Math.max(0, o.refPrice));
+      continue;
+    }
+    if (o.bid == null) missingBids += 1;
     bidSum += o.bid ?? 0;
+    if (o.emptyBook) {
+      emptyBooks += 1;
+      continue;
+    }
+    activeCount += 1;
     askSum += o.ask ?? 0;
     if (o.bid != null && (!minBid || o.bidSize < minBid.size)) minBid = { size: o.bidSize, title: o.title };
   }
+  const r2 = (x: number) => Math.round(x * 100) / 100; // 去掉浮点累加尾数
   return {
     slug: info.slug,
     title: info.title,
     url: info.url,
     negRisk: info.negRisk,
-    outcomeCount: markets.length,
-    tradeableCount: tradeable.length,
+    outcomeCount,
+    tradeableCount,
+    activeCount,
     outcomes,
-    bidSum: Math.round(bidSum * 100) / 100, // 去掉浮点累加尾数
-    askSum: Math.round(askSum * 100) / 100,
+    bidSum: r2(bidSum),
+    askSum: r2(askSum),
     missingBids,
+    emptyBooks,
     failed,
+    estMissing: r2(estMissing),
+    bidSumUpper: r2(bidSum + estMissing),
+    complete: failed === 0,
     minBid,
     checkedAt: new Date().toISOString()
   };
+}
+
+export async function analyzeMarkets(
+  info: CategoryInfo,
+  markets: PredictMarketSummary[],
+  options: { concurrency?: number } = {}
+): Promise<CategoryAnalysis> {
+  const tradeable = markets.filter((m) => m.tradeable);
+  const concurrency = options.concurrency ?? envNumber('NEGRISK_SCAN_CONCURRENCY', 2);
+  const outcomes = await mapLimit(tradeable.map(outcomeRef), concurrency, quoteOutcome);
+  return summarize(info, outcomes, markets.length, tradeable.length);
+}
+
+// 只补查上次获取失败的结果，其余沿用，然后重新汇总
+export async function requoteFailed(a: CategoryAnalysis): Promise<CategoryAnalysis> {
+  const failed = a.outcomes.filter((o) => o.error);
+  if (!failed.length) return a;
+  const concurrency = envNumber('NEGRISK_SCAN_CONCURRENCY', 2);
+  const fresh = await mapLimit(
+    failed.map((o) => ({ id: o.id, title: o.title, questionIndex: o.questionIndex, refPrice: o.refPrice })),
+    concurrency,
+    quoteOutcome
+  );
+  const byId = new Map(fresh.map((q) => [q.id, q]));
+  const merged = a.outcomes.map((o) => byId.get(o.id) ?? o);
+  return summarize({ slug: a.slug, title: a.title, url: a.url, negRisk: a.negRisk }, merged, a.outcomeCount, a.tradeableCount);
 }
 
 function predictHeaders(): Record<string, string> {
@@ -426,7 +497,43 @@ function estimateFromCache(g: MarketGroup): number | null {
     if (c == null) return null;
     sum += c;
   }
-  return sum;
+  return Math.round(sum * 100) / 100;
+}
+
+export type ScanCandidate = { g: MarketGroup; est: number | null };
+export type ScanPlan = {
+  detectMode: 'flag' | 'heuristic';
+  groups: MarketGroup[]; // 可转换的候选类目
+  prefiltered: ScanCandidate[]; // 参考价之和 < cutoff，跳过
+  ranked: ScanCandidate[]; // 要扫的，按优先级：没参考价的在前（未知就得查），其余估值高的在前
+  toScan: ScanCandidate[]; // ranked 截到每轮上限
+  maxCategories: number;
+  margin: number;
+  cutoff: number; // thresholdCents − margin；margin < 0 表示关闭预过滤
+};
+
+// 扫描计划：扫描和 /yes_why 诊断共用同一套规则，诊断结果才能解释扫描行为
+export function planScan(entry: MarketsCacheEntry, thresholdCents: number): ScanPlan {
+  const detectMode = detectModeOf(entry.markets);
+  const groups = groupMarketsByCategory(entry.markets).filter((g) => isConvertibleGroup(g, detectMode));
+  // 预过滤：缓存参考价之和远低于阈值的类目跳过，省订单簿请求。
+  // NEGRISK_PREFILTER_MARGIN=¢ 余量（默认 5），设 -1 关闭预过滤。
+  const margin = envNumber('NEGRISK_PREFILTER_MARGIN', 5);
+  const cutoff = thresholdCents - margin;
+  const prefiltered: ScanCandidate[] = [];
+  const ranked: ScanCandidate[] = [];
+  for (const g of groups) {
+    const est = estimateFromCache(g);
+    if (margin >= 0 && est != null && est < cutoff) prefiltered.push({ g, est });
+    else ranked.push({ g, est });
+  }
+  ranked.sort((a, b) => {
+    if (a.est == null && b.est != null) return -1;
+    if (a.est != null && b.est == null) return 1;
+    return (b.est ?? 0) - (a.est ?? 0);
+  });
+  const maxCategories = Math.max(1, envNumber('NEGRISK_SCAN_MAX_CATEGORIES', 200));
+  return { detectMode, groups, prefiltered, ranked, toScan: ranked.slice(0, maxCategories), maxCategories, margin, cutoff };
 }
 
 export async function scanConvertibleCategories(options: { thresholdCents?: number } = {}): Promise<ScanResult> {
@@ -435,95 +542,112 @@ export async function scanConvertibleCategories(options: { thresholdCents?: numb
   const entry = getCachedMarkets();
   if (!entry) throw new Error('市场缓存还没就绪，稍后再试（或先 /refresh）');
 
-  const detectMode = detectModeOf(entry.markets);
-  const groups = groupMarketsByCategory(entry.markets).filter((g) => isConvertibleGroup(g, detectMode));
-
-  // 预过滤：缓存参考价之和远低于阈值的类目跳过，省订单簿请求。
-  // NEGRISK_PREFILTER_MARGIN=¢ 余量（默认 5），设 -1 关闭预过滤。
-  const margin = envNumber('NEGRISK_PREFILTER_MARGIN', 5);
-  const ranked: Array<{ g: MarketGroup; est: number | null }> = [];
-  let prefiltered = 0;
-  for (const g of groups) {
-    const est = estimateFromCache(g);
-    if (margin >= 0 && est != null && est < thresholdCents - margin) {
-      prefiltered += 1;
-      continue;
-    }
-    ranked.push({ g, est });
-  }
-  // 估值高的先扫；没估值的排在后面但仍会扫
-  ranked.sort((a, b) => (b.est ?? -1) - (a.est ?? -1));
-
-  const maxCategories = envNumber('NEGRISK_SCAN_MAX_CATEGORIES', 200);
-  const capped = ranked.length > maxCategories;
-  const toScan = ranked.slice(0, maxCategories);
-  const categoryConcurrency = envNumber('NEGRISK_SCAN_CATEGORY_CONCURRENCY', 2);
+  const plan = planScan(entry, thresholdCents);
+  const categoryConcurrency = envNumber('NEGRISK_SCAN_CATEGORY_CONCURRENCY', 1);
 
   let requests = 0;
-  const results = await mapLimit(toScan, categoryConcurrency, async ({ g }) => {
+  const results = await mapLimit(plan.toScan, categoryConcurrency, async ({ g }) => {
     requests += g.markets.filter((m) => m.tradeable).length;
-    return analyzeMarkets({ slug: g.slug, title: g.title, url: g.url, negRisk: negRiskOfGroup(g.markets, detectMode) }, g.markets);
+    return analyzeMarkets({ slug: g.slug, title: g.title, url: g.url, negRisk: negRiskOfGroup(g.markets, plan.detectMode) }, g.markets);
   });
+
+  // 第一遍有订单簿没查到（多半是 429）的类目，等限速器放行后只补查失败的那几个结果
+  let retriedCategories = 0;
+  if (process.env.NEGRISK_RETRY_FAILED !== '0') {
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].failed === 0) continue;
+      requests += results[i].failed;
+      retriedCategories += 1;
+      results[i] = await requoteFailed(results[i]);
+    }
+  }
+
   results.sort((a, b) => b.bidSum - a.bidSum);
   const hits = results.filter((r) => r.bidSum >= thresholdCents);
   const scan: ScanResult = {
     checkedAt: new Date().toISOString(),
     durationMs: Date.now() - start,
-    detectMode,
+    detectMode: plan.detectMode,
     thresholdCents,
-    candidates: groups.length,
-    prefiltered,
+    candidates: plan.groups.length,
+    prefiltered: plan.prefiltered.length,
+    unknownEstimate: plan.ranked.filter((c) => c.est == null).length,
     scanned: results.length,
-    capped,
+    capped: plan.ranked.length > plan.toScan.length,
+    droppedByCap: plan.ranked.length - plan.toScan.length,
     requests,
     failedCategories: results.filter((r) => r.failed > 0).length,
+    retriedCategories,
     results,
     hits
   };
   console.log(
-    `[negrisk] scan: mode=${detectMode} candidates=${groups.length} prefiltered=${prefiltered} scanned=${results.length}${capped ? ' (capped)' : ''} requests=${requests} hits=${hits.length} top=${results[0] ? `${results[0].bidSum.toFixed(1)}¢ ${results[0].title}` : '-'} ${scan.durationMs}ms`
+    `[negrisk] scan: mode=${plan.detectMode} candidates=${scan.candidates} prefiltered=${scan.prefiltered} unknownEst=${scan.unknownEstimate} scanned=${scan.scanned}${scan.capped ? ` (capped, dropped ${scan.droppedByCap})` : ''} requests=${requests} retried=${retriedCategories} stillFailed=${scan.failedCategories} hits=${hits.length} top=${results[0] ? `${results[0].bidSum.toFixed(1)}¢ ${results[0].title}` : '-'} ${scan.durationMs}ms`
   );
   return scan;
 }
 
+// 列表/报告里该不该显示：总和 ≥ 下限，或者没查全但上限估计 ≥ 下限（宁可多显示也不静默漏掉）
+export function passesFloor(a: CategoryAnalysis, minCents: number): boolean {
+  return a.bidSum >= minCents || (a.failed > 0 && a.bidSumUpper >= minCents);
+}
+
 // ---------------- 消息格式 ----------------
+
+function fmtSum(a: CategoryAnalysis): string {
+  // 没查全时总和是下限
+  return `${a.failed ? '≥ ' : ''}${fmtC(a.bidSum)}`;
+}
 
 export function formatCategoryReport(a: CategoryAnalysis, thresholdCents = getNegRiskThreshold()): string {
   const edge = a.bidSum - 100;
   const lines: string[] = [];
   lines.push(`🔁 ${a.title}`);
   lines.push(
-    `可转换(NegRisk): ${a.negRisk === true ? '是' : a.negRisk === false ? '否' : '未知'} · ${a.outcomeCount} 个结果（可交易 ${a.tradeableCount}）`
+    `可转换(NegRisk): ${a.negRisk === true ? '是' : a.negRisk === false ? '否' : '未知'} · ${a.outcomeCount} 个结果（可交易 ${a.tradeableCount} · 活跃 ${a.activeCount}${a.emptyBooks ? ` · 盘口空 ${a.emptyBooks}` : ''}${a.failed ? ` · 未查到 ${a.failed}` : ''}）`
   );
   lines.push(
-    `Σ Yes 买1 = ${fmtC(a.bidSum)}（阈值 ${fmtC(thresholdCents, 1)} → ${a.bidSum >= thresholdCents ? '✅ 达到' : '❌ 未达到'}）`
+    `Σ Yes 买1 = ${fmtSum(a)}${a.failed ? `（${a.failed} 个结果未查到，最多再 +${a.estMissing.toFixed(1)}¢）` : ''}（阈值 ${fmtC(thresholdCents, 1)} → ${a.bidSum >= thresholdCents ? '✅ 达到' : a.failed && a.bidSumUpper >= thresholdCents ? '❓ 可能达到，需重查' : '❌ 未达到'}）`
   );
-  lines.push(`Σ Yes 卖1 = ${fmtC(a.askSum)} · 转换套利每份 ≈ ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}¢（未扣手续费）`);
+  lines.push(`活跃结果 Σ Yes 卖1 = ${fmtC(a.askSum)} · 转换套利每份 ≈ ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}¢（未扣手续费）`);
   if (a.negRisk === false) lines.push('⚠️ 接口标记这个类目不是 NegRisk，否 不能转换成 Yes');
   lines.push('');
-  lines.push('结果 · Yes买1 ×深度 · Yes卖1 · 持「否」转换后可卖 / 直接卖否');
-  a.outcomes.forEach((o, i) => {
-    if (o.error) {
-      lines.push(`${i + 1}. ${o.title} · ❌ 订单簿获取失败`);
-      return;
-    }
-    const convert = a.bidSum - (o.bid ?? 0); // 转换成其余结果的 Yes 后按买一卖出
-    const noBid = o.ask == null ? null : 100 - o.ask; // 否 的买一 = 100 − Yes 卖一
-    lines.push(
-      `${i + 1}. ${o.title} · ${o.bid == null ? '无买单' : `${fmtC(o.bid)} ×${fmtN(o.bidSize)}`} · ${fmtC(o.ask)} · ${fmtC(convert)} / ${fmtC(noBid)}`
-    );
-  });
+  const active = a.outcomes.filter((o) => !o.error && !o.emptyBook);
+  const empty = a.outcomes.filter((o) => !o.error && o.emptyBook);
+  const failed = a.outcomes.filter((o) => o.error);
+  if (active.length) {
+    lines.push('结果 · Yes买1 ×深度 · Yes卖1 · 持「否」转换后可卖 / 直接卖否 · 否参考价值');
+    active.forEach((o, i) => {
+      const convert = a.bidSum - (o.bid ?? 0); // 转换成其余结果的 Yes 后按买一卖出
+      const noBid = o.ask == null ? null : 100 - o.ask; // 否 的买一 = 100 − Yes 卖一
+      lines.push(`${i + 1}. ${o.title} · ${fmtC(o.bid)} ×${fmtN(o.bidSize)} · ${fmtC(o.ask)} · ${fmtC(convert)} / ${fmtC(noBid)} · 否≈${fmtC(o.noValue)}`);
+    });
+  } else {
+    lines.push('没有盘口正常的活跃结果。');
+  }
+  if (empty.length) {
+    const parts = empty.slice(0, 8).map((o) => `${shortTitle(o.title)}（${o.bid == null ? '无买单' : `买1 ${fmtC(o.bid)}`} · ${o.ask == null ? '无卖单' : `卖1 ${fmtC(o.ask)}`}）`);
+    if (empty.length > 8) parts.push(`…还有 ${empty.length - 8} 个`);
+    lines.push('');
+    lines.push(`盘口空 / 无买单（${empty.length}）：${parts.join('、')}`);
+    lines.push('这些结果多半已淘汰或无人做市，否的参考价值接近 100¢，不要拿它们的否去转换。');
+  }
+  if (failed.length) {
+    lines.push('');
+    lines.push(`❌ 未查到订单簿（${failed.length}）：${failed.slice(0, 8).map((o) => shortTitle(o.title)).join('、')}${failed.length > 8 ? ` …还有 ${failed.length - 8} 个` : ''}（按 0 计，总和偏低）`);
+  }
   lines.push('');
   if (a.minBid) lines.push(`最小买1深度: ${fmtN(a.minBid.size)} 份（${a.minBid.title}）`);
-  if (a.missingBids) lines.push(`无买单的结果: ${a.missingBids} 个（按 0 计）`);
-  if (a.failed) lines.push(`订单簿获取失败: ${a.failed} 个（按 0 计，总和偏低）`);
   lines.push(a.url);
   return lines.join('\n');
 }
 
 function outcomeSummary(a: CategoryAnalysis, max = 12): string {
-  const parts = a.outcomes.slice(0, max).map((o) => `${shortTitle(o.title)} ${o.error ? '❌' : o.bid == null ? '-' : o.bid.toFixed(1)}`);
-  if (a.outcomes.length > max) parts.push(`…还有 ${a.outcomes.length - max} 个`);
+  const active = a.outcomes.filter((o) => !o.error && !o.emptyBook);
+  const parts = active.slice(0, max).map((o) => `${shortTitle(o.title)} ${o.bid == null ? '-' : o.bid.toFixed(1)}`);
+  if (active.length > max) parts.push(`…还有 ${active.length - max} 个`);
+  if (a.emptyBooks) parts.push(`盘口空 ${a.emptyBooks} 个`);
+  if (a.failed) parts.push(`❌ 未查到 ${a.failed} 个`);
   return parts.join(' · ');
 }
 
@@ -544,7 +668,7 @@ export function formatAlertMessage(
     lines.push('');
     lines.push(`${i + 1}. ${a.title}`);
     lines.push(
-      `   Σ Yes买1 = ${fmtC(a.bidSum)}（每份 ≈ ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}¢）· ${a.tradeableCount} 个结果 · 最小买1深度 ${a.minBid ? fmtN(a.minBid.size) : '-'}${a.failed ? ` · ❌${a.failed} 个获取失败` : ''}`
+      `   Σ Yes买1 = ${fmtSum(a)}（每份 ≈ ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}¢）· 活跃 ${a.activeCount}/${a.tradeableCount} 个结果 · 最小买1深度 ${a.minBid ? fmtN(a.minBid.size) : '-'}${a.failed ? ` · ❌${a.failed} 个未查到` : ''}`
     );
     lines.push(`   ${outcomeSummary(a)}`);
     lines.push(`   ${a.url}`);
@@ -575,17 +699,17 @@ export function formatScanReport(
   const max = options.max ?? envNumber('NEGRISK_REPORT_MAX', 40);
   const lines: string[] = [
     `🔁 可转换市场扫描（提醒阈值 ${fmtC(scan.thresholdCents)} · 显示下限 ${fmtC(minCents)}）`,
-    `候选 ${scan.candidates} 个类目 · 预过滤跳过 ${scan.prefiltered} · 实际查询 ${scan.scanned}${scan.capped ? '（已达上限 NEGRISK_SCAN_MAX_CATEGORIES）' : ''} · 订单簿请求 ${scan.requests} · ${Math.round(scan.durationMs / 1000)}s`,
-    `判定方式: ${scan.detectMode === 'flag' ? '接口 isNegRisk 字段' : '启发式（≥3 个结果的类目，接口没给 isNegRisk）'}`,
+    `候选 ${scan.candidates} 个类目 · 预过滤跳过 ${scan.prefiltered} · 实际查询 ${scan.scanned}${scan.capped ? `（超每轮上限，截掉 ${scan.droppedByCap} 个，调大 NEGRISK_SCAN_MAX_CATEGORIES）` : ''} · 订单簿请求 ${scan.requests} · ${Math.round(scan.durationMs / 1000)}s`,
+    `判定方式: ${scan.detectMode === 'flag' ? '接口 isNegRisk 字段' : '启发式（≥3 个结果的类目，接口没给 isNegRisk）'}${scan.retriedCategories ? ` · 补查 ${scan.retriedCategories} 个类目` : ''}${scan.failedCategories ? ` · ⚠️ ${scan.failedCategories} 个类目仍有结果未查到` : ''}`,
     `达到提醒阈值: ${scan.hits.length} 个`
   ];
   if (!scan.results.length) {
     lines.push('', '没有可扫描的类目。');
     return lines.join('\n');
   }
-  let list = scan.results.filter((a) => a.bidSum >= minCents);
+  let list = scan.results.filter((a) => passesFloor(a, minCents));
   if (list.length) {
-    lines.push('', `Σ Yes 买1 ≥ ${fmtC(minCents)} 的 ${list.length} 个（✅ = 达到提醒阈值）：`);
+    lines.push('', `Σ Yes 买1 ≥ ${fmtC(minCents)} 的 ${list.length} 个（✅ = 达到提醒阈值，≥ = 没查全只是下限）：`);
   } else {
     // 下限以上一个都没有：仍然给最高的几个，免得空手而归
     list = scan.results.slice(0, 5);
@@ -594,14 +718,14 @@ export function formatScanReport(
   const shown = list.slice(0, max);
   shown.forEach((a, i) => {
     lines.push(
-      `${i + 1}. ${a.bidSum >= scan.thresholdCents ? '✅' : '▫️'} ${fmtC(a.bidSum)} · ${a.title}（${a.tradeableCount} 个结果${a.failed ? `，❌${a.failed}` : ''}）`
+      `${i + 1}. ${a.bidSum >= scan.thresholdCents ? '✅' : '▫️'} ${fmtSum(a)} · ${a.title}（活跃 ${a.activeCount}/${a.tradeableCount}${a.failed ? `，${a.failed} 个未查到` : ''}）`
     );
     lines.push(`   ${a.url}`);
   });
   if (list.length > shown.length) {
     lines.push(`…还有 ${list.length - shown.length} 个（提高下限：/yes_check 98，或改 NEGRISK_REPORT_MAX）`);
   }
-  lines.push('', `换个下限看: /yes_check 90 · 固定下限: /yes_show 90 · 全部: /yes_check all`);
+  lines.push('', `换个下限看: /yes_check 90 · 固定下限: /yes_show 90 · 全部: /yes_check all · 某类目为何不在列表: /yes_why <链接>`);
   return lines.join('\n');
 }
 
@@ -708,4 +832,173 @@ export function startNegRiskMonitor(): void {
   // 等市场缓存先拉完（缓存启动 10s 后开始，首次要 1-3 分钟）
   setTimeout(() => void tick(), 90_000);
   globalThis.__negRiskTimer = setInterval(() => void tick(), intervalMs);
+}
+
+// ---------------- 诊断：某个类目为什么不在列表里 ----------------
+
+export type CategoryDiagnosis = {
+  slug: string;
+  thresholdCents: number;
+  displayMinCents: number;
+  cacheReady: boolean;
+  cacheFetchedAt: string | null;
+  cacheComplete: boolean | null;
+  inCache: boolean;
+  marketsInCache: number;
+  tradeableInCache: number;
+  detectMode: 'flag' | 'heuristic' | null;
+  flaggedMarkets: number; // 缓存里这个类目带 isNegRisk/negRiskOnChainId 的市场数
+  convertible: boolean | null;
+  estimate: number | null; // 缓存参考价之和
+  cutoff: number | null; // 低于这个值被预过滤
+  prefiltered: boolean | null;
+  rank: number | null; // 在本轮扫描队列里的位置（1 = 最先）
+  queueLength: number | null;
+  maxCategories: number | null;
+  capped: boolean | null; // 排名超过每轮上限
+  lastScan: {
+    at: string;
+    scanned: boolean;
+    bidSum: number | null;
+    bidSumUpper: number | null;
+    failed: number | null;
+    activeCount: number | null;
+    passesFloor: boolean | null;
+  } | null;
+  conclusion: string; // 一句话结论
+};
+
+export function diagnoseCategory(input: string): CategoryDiagnosis {
+  const slug = extractPredictSlug(input);
+  const thresholdCents = getNegRiskThreshold();
+  const displayMinCents = getNegRiskDisplayMin();
+  const entry = getCachedMarkets();
+  const d: CategoryDiagnosis = {
+    slug,
+    thresholdCents,
+    displayMinCents,
+    cacheReady: !!entry,
+    cacheFetchedAt: entry?.fetchedAt ?? null,
+    cacheComplete: entry?.complete ?? null,
+    inCache: false,
+    marketsInCache: 0,
+    tradeableInCache: 0,
+    detectMode: null,
+    flaggedMarkets: 0,
+    convertible: null,
+    estimate: null,
+    cutoff: null,
+    prefiltered: null,
+    rank: null,
+    queueLength: null,
+    maxCategories: null,
+    capped: null,
+    lastScan: null,
+    conclusion: ''
+  };
+  if (!slug) {
+    d.conclusion = '没解析出 slug，请发 predict.fun 的市场链接';
+    return d;
+  }
+  if (!entry) {
+    d.conclusion = '市场缓存还没就绪，后台扫描还没开始；等缓存抓完或先 /refresh';
+    return d;
+  }
+  const g = groupFromCache(slug);
+  if (!g) {
+    d.conclusion = `缓存里没有这个类目（缓存抓取于 ${entry.fetchedAt}，${entry.complete ? '翻到底了' : '没翻到底'}）。可能类目状态不是 ${process.env.PREDICT_CATEGORY_STATUS || 'OPEN'} 被服务端过滤，或者抓取没覆盖到它；链接查询走的是单类目接口，不受影响`;
+    return d;
+  }
+  d.inCache = true;
+  d.marketsInCache = g.markets.length;
+  d.tradeableInCache = g.markets.filter((m) => m.tradeable).length;
+  const plan = planScan(entry, thresholdCents);
+  d.detectMode = plan.detectMode;
+  d.flaggedMarkets = g.markets.filter((m) => m.isNegRisk === true || !!m.negRiskOnChainId).length;
+  const key = g.slug.toLowerCase();
+  d.convertible = plan.groups.some((x) => x.slug.toLowerCase() === key);
+  d.cutoff = plan.margin >= 0 ? plan.cutoff : null;
+  d.maxCategories = plan.maxCategories;
+  d.queueLength = plan.ranked.length;
+
+  const last = getLastScan();
+  const scanned = last?.results.find((r) => r.slug.toLowerCase() === key) ?? null;
+  if (last) {
+    d.lastScan = {
+      at: last.checkedAt,
+      scanned: !!scanned,
+      bidSum: scanned?.bidSum ?? null,
+      bidSumUpper: scanned?.bidSumUpper ?? null,
+      failed: scanned?.failed ?? null,
+      activeCount: scanned?.activeCount ?? null,
+      passesFloor: scanned ? passesFloor(scanned, displayMinCents) : null
+    };
+  }
+
+  if (!d.convertible) {
+    d.conclusion =
+      plan.detectMode === 'flag'
+        ? d.tradeableInCache < 2
+          ? `缓存里这个类目可交易的结果只有 ${d.tradeableInCache} 个，不算可转换类目`
+          : `缓存里这个类目的 ${d.marketsInCache} 个市场都没有 isNegRisk / negRiskOnChainId 标记（列表接口给的字段可能比单类目接口少），被判定为不可转换，扫描不查它`
+        : `启发式判定下需要 ≥3 个可交易结果，这个类目只有 ${d.tradeableInCache} 个`;
+    return d;
+  }
+  const pre = plan.prefiltered.find((c) => c.g.slug.toLowerCase() === key);
+  if (pre) {
+    d.estimate = pre.est;
+    d.prefiltered = true;
+    d.conclusion = `被预过滤跳过：缓存参考价之和 ${pre.est?.toFixed(1)}¢ 低于 ${plan.cutoff.toFixed(1)}¢（阈值 ${thresholdCents} − 余量 ${plan.margin}）。参考价是缓存抓取时的旧价，盘口变动大时会误判；调大 NEGRISK_PREFILTER_MARGIN 或设 -1 关闭预过滤`;
+    return d;
+  }
+  d.prefiltered = false;
+  const idx = plan.ranked.findIndex((c) => c.g.slug.toLowerCase() === key);
+  if (idx >= 0) {
+    d.estimate = plan.ranked[idx].est;
+    d.rank = idx + 1;
+    d.capped = idx >= plan.maxCategories;
+  }
+  if (d.capped) {
+    d.conclusion = `在扫描队列里排第 ${d.rank}/${d.queueLength}，超过每轮上限 ${plan.maxCategories}，这轮没轮到。调大 NEGRISK_SCAN_MAX_CATEGORIES，或收紧预过滤让队列变短`;
+    return d;
+  }
+  if (!last) {
+    d.conclusion = '还没有任何一轮扫描结果（后台首次扫描在启动约 90 秒后）';
+    return d;
+  }
+  if (!scanned) {
+    d.conclusion = `本应在上次扫描（${last.checkedAt}）的队列里（第 ${d.rank} 位），但结果里没有它：多半是它在那之后才进入候选，或那轮扫描中途出错；等下一轮或点「立即重扫」`;
+    return d;
+  }
+  if (scanned.failed > 0 && !passesFloor(scanned, displayMinCents)) {
+    d.conclusion = `上次扫描查到了，但 ${scanned.failed} 个结果的订单簿没查到（多半是 429 限流），总和按 0 计只有 ${scanned.bidSum.toFixed(1)}¢，连上限估计 ${scanned.bidSumUpper.toFixed(1)}¢ 也低于显示下限 ${displayMinCents}¢`;
+    return d;
+  }
+  if (!passesFloor(scanned, displayMinCents)) {
+    d.conclusion = `上次扫描（${last.checkedAt}）算出 Σ Yes 买1 = ${scanned.bidSum.toFixed(1)}¢，低于显示下限 ${displayMinCents}¢，所以列表没显示；链接查询是实时的，盘口这几分钟可能变了。降低下限 /yes_show 或等下一轮`;
+    return d;
+  }
+  d.conclusion = `上次扫描（${last.checkedAt}）算出 ${scanned.failed ? '≥ ' : ''}${scanned.bidSum.toFixed(1)}¢${scanned.failed ? `（${scanned.failed} 个未查到）` : ''}，≥ 显示下限 ${displayMinCents}¢，应该在列表里；网页没显示就刷新一下，或检查"只看达标"勾选`;
+  return d;
+}
+
+export function formatDiagnosis(d: CategoryDiagnosis): string {
+  const lines = [`🔎 ${d.slug}`, d.conclusion, ''];
+  lines.push(`缓存: ${d.cacheReady ? `${d.inCache ? '有' : '无'}这个类目 · 抓取于 ${d.cacheFetchedAt}（${d.cacheComplete ? '完整' : '不完整'}）` : '未就绪'}`);
+  if (d.inCache) {
+    lines.push(`市场: ${d.marketsInCache} 个（可交易 ${d.tradeableInCache}）· 判定方式 ${d.detectMode === 'flag' ? '接口 isNegRisk' : '启发式'} · 带标记 ${d.flaggedMarkets} 个 → 可转换: ${d.convertible ? '是' : '否'}`);
+    if (d.cutoff != null) lines.push(`预过滤: 参考价之和 ${d.estimate == null ? '无（缺参考价，优先扫）' : `${d.estimate.toFixed(1)}¢`} vs 下限 ${d.cutoff.toFixed(1)}¢ → ${d.prefiltered ? '跳过' : '不跳过'}`);
+    if (d.rank != null) lines.push(`队列: 第 ${d.rank}/${d.queueLength} 位 · 每轮上限 ${d.maxCategories} → ${d.capped ? '这轮没轮到' : '在本轮内'}`);
+  }
+  if (d.lastScan) {
+    lines.push(
+      d.lastScan.scanned
+        ? `上次扫描 ${d.lastScan.at}: Σ ${d.lastScan.failed ? '≥ ' : ''}${d.lastScan.bidSum?.toFixed(1)}¢（未查到 ${d.lastScan.failed}，上限 ${d.lastScan.bidSumUpper?.toFixed(1)}¢，活跃 ${d.lastScan.activeCount}）→ ${d.lastScan.passesFloor ? '在列表里' : '低于显示下限'}`
+        : `上次扫描 ${d.lastScan.at}: 没有这个类目`
+    );
+  } else {
+    lines.push('上次扫描: 还没有');
+  }
+  lines.push(`阈值 ${d.thresholdCents}¢ · 显示下限 ${d.displayMinCents}¢`);
+  return lines.join('\n');
 }
