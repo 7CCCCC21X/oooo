@@ -81,5 +81,9 @@ export type PredictMarketSummary = {
   polymarketConditionIds: string[];
   hasPolymarket: boolean;
   tradeable: boolean;
+  // NegRisk（多结果可转换）相关：来自 /v1/categories 的 market.isNegRisk / market.questionIndex / category.negRiskOnChainId
+  isNegRisk?: boolean;
+  questionIndex?: number;
+  negRiskOnChainId?: string;
   raw?: unknown;
 };

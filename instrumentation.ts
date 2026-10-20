@@ -11,4 +11,6 @@ export async function register() {
     await notifyNewMarkets(entry);
   });
   startBackgroundCacheRefresh();
+  const { startNegRiskMonitor } = await import('./lib/negrisk');
+  startNegRiskMonitor();
 }

@@ -226,6 +226,10 @@ export function normalizeMarket(raw: any): PredictMarketSummary {
   const active = typeof raw?.active === 'boolean' ? raw.active : undefined;
   const category = raw?.category ? String(raw.category) : raw?.categoryName ? String(raw.categoryName) : undefined;
   const categoryStatus = raw?.categoryStatus ? String(raw.categoryStatus) : undefined;
+  const isNegRisk = typeof raw?.isNegRisk === 'boolean' ? raw.isNegRisk : typeof raw?.is_neg_risk === 'boolean' ? raw.is_neg_risk : undefined;
+  const questionIndexRaw = numberOrNull(raw?.questionIndex ?? raw?.question_index);
+  const questionIndex = questionIndexRaw == null ? undefined : questionIndexRaw;
+  const negRiskOnChainId = raw?.negRiskOnChainId ? String(raw.negRiskOnChainId) : undefined;
   const endMs = marketEndMs(raw);
   const volume = numberOrNull(raw?.volume ?? raw?.totalVolume ?? raw?.total_volume) ?? undefined;
   const liquidity = numberOrNull(raw?.liquidity ?? raw?.totalLiquidity ?? raw?.total_liquidity) ?? undefined;
@@ -259,8 +263,36 @@ export function normalizeMarket(raw: any): PredictMarketSummary {
     shareThreshold,
     polymarketConditionIds,
     hasPolymarket: polymarketConditionIds.length > 0,
-    tradeable: isTradeable(raw, endMs)
+    tradeable: isTradeable(raw, endMs),
+    isNegRisk,
+    questionIndex,
+    negRiskOnChainId
   };
+}
+
+// 把一个 category 里嵌的 markets 补上 category 信息后 normalize（去重按 id）
+export function normalizeCategoryMarkets(cat: any): PredictMarketSummary[] {
+  const markets = Array.isArray(cat?.markets) ? cat.markets : [];
+  const out: PredictMarketSummary[] = [];
+  const seen = new Set<string>();
+  for (const m of markets) {
+    const id = String(m?.id ?? '').trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const negRiskOnChainId = m?.negRiskOnChainId ?? cat?.negRiskOnChainId;
+    out.push(
+      normalizeMarket({
+        ...m,
+        categorySlug: m?.categorySlug ?? cat?.slug,
+        categoryTitle: cat?.title,
+        categoryStatus: cat?.status,
+        negRiskOnChainId,
+        // 市场没带 isNegRisk 但类目有链上 NegRisk id → 也算 NegRisk
+        isNegRisk: typeof m?.isNegRisk === 'boolean' ? m.isNegRisk : negRiskOnChainId ? true : undefined
+      })
+    );
+  }
+  return out;
 }
 
 type FetchOptions = {
@@ -806,23 +838,14 @@ export function flattenCategoryMarkets(
   let categoriesWithoutMarkets = 0;
 
   for (const cat of categories) {
-    const markets = Array.isArray(cat.markets) ? cat.markets : [];
-    if (!markets.length) {
+    const normalized = normalizeCategoryMarkets(cat);
+    if (!normalized.length) {
       categoriesWithoutMarkets += 1;
       continue;
     }
-    for (const m of markets) {
-      const id = String(m?.id ?? '').trim();
-      if (!id || seenMarketIds.has(id)) continue;
-      seenMarketIds.add(id);
-      // 补 category 信息到 market 对象再 normalize
-      const enriched = {
-        ...m,
-        categorySlug: m.categorySlug ?? cat.slug,
-        categoryTitle: cat.title,
-        categoryStatus: cat.status
-      };
-      const summary = normalizeMarket(enriched);
+    for (const summary of normalized) {
+      if (seenMarketIds.has(summary.id)) continue;
+      seenMarketIds.add(summary.id);
       if (!includeClosed && !summary.tradeable) continue;
       out.push(summary);
     }

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { fetchJson } from '@/lib/fetch-json';
 import { fetchAllPredictMarkets } from '@/lib/predict-markets';
+import { extractPredictSlug } from '@/lib/predict-url';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -11,20 +12,7 @@ function lower(value: unknown): string {
   return value == null ? '' : String(value).toLowerCase();
 }
 
-function extractSlug(input: string): string {
-  let s = input.trim();
-  if (!s) return '';
-  try {
-    const u = new URL(s);
-    s = u.pathname;
-  } catch {
-    // not a URL; treat as raw slug
-  }
-  s = s.replace(/^\/(zh-cn|zh|en|ja|ko|es|fr|de|pt|ru)(?=\/)/i, '');
-  const m = s.match(/\/(markets?|categories|categor[iy]|events?)\/([^/?#]+)/);
-  if (m) return m[2];
-  return s.replace(/^\/+/, '').split(/[/?#]/)[0];
-}
+const extractSlug = extractPredictSlug;
 
 function predictHeaders(): Record<string, string> {
   const headers: Record<string, string> = { Accept: 'application/json' };

@@ -27,6 +27,16 @@
 `polymarketConditionIds` 为空 → 去噪音关键词 → 可交易（市场/交易状态未关闭、所属类目未 RESOLVED、未到期、`closed`/`active` 标记）→ PP/h > 0。
 - `GET /api/health` — 健康检查 + 监控状态
 
+## 可转换(NegRisk)市场：Yes 买1 总和
+
+多结果类目（比如"哪个赛区夺冠"）里，1 份某结果的「否」可以转换成其余每个结果各 1 份「是」。所以当类目里**所有结果的 Yes 买1 价之和 > 100¢** 时：买 否 → 转换 → 按买1 价卖出其余 Yes，每份赚 `Σ Yes买1 − 100`（未扣手续费）。
+
+- 发链接（或 `/yes <链接>`）：查该类目每个结果的 Yes 买1/卖1、总和，以及"持否转换后可卖 vs 直接卖否"。
+- `/yes_check`：扫描缓存里全部可转换类目，列出总和最高的。
+- 后台每 `NEGRISK_CHECK_INTERVAL_MS`（默认 5 分钟）扫一遍，总和 ≥ 阈值的类目推送到 `/subscribe_yes` 订阅的话题（没订阅就发 `TELEGRAM_CHAT_ID`）。
+- 阈值默认 100¢，`/yes_threshold 101` 随时改（持久化到 `NEGRISK_STATE_FILE`）；`/yes_off` `/yes_on` 开关。
+- 是否可转换按接口的 `isNegRisk` / `negRiskOnChainId` 判断；接口没给这些字段时退化为"≥3 个结果的类目"。
+
 ## 后台监控
 
 Railway 是长进程容器，所以 Telegram 提醒直接由 Next.js 进程内的 `setInterval` 跑（`instrumentation.ts` 在生产启动时拉起）。不需要外部 cron。

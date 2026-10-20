@@ -1,7 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export type SubMode = 'predict_only' | 'all';
+// predict_only / all：新市场提醒；negrisk：可转换市场 Yes 买1 总和提醒
+export type SubMode = 'predict_only' | 'all' | 'negrisk';
+export const SUB_MODES: SubMode[] = ['predict_only', 'all', 'negrisk'];
 export type Subscription = { chatId: string; threadId: number | null; mode: SubMode };
 
 declare global {
@@ -34,7 +36,7 @@ function load(): Map<string, Subscription> {
               seed(item, null, 'predict_only');
             } else if (item && item.chatId != null) {
               const tid = item.threadId == null ? null : Number(item.threadId);
-              const mode: SubMode = item.mode === 'all' ? 'all' : 'predict_only';
+              const mode: SubMode = item.mode === 'all' ? 'all' : item.mode === 'negrisk' ? 'negrisk' : 'predict_only';
               seed(String(item.chatId), Number.isFinite(tid as number) ? (tid as number) : null, mode);
             }
           }
@@ -90,7 +92,7 @@ export function removeSubscriber(chatId: string | number, threadId: number | nul
 export function removeAllModes(chatId: string | number, threadId: number | null): number {
   const map = load();
   let removed = 0;
-  for (const mode of ['predict_only', 'all'] as SubMode[]) {
+  for (const mode of SUB_MODES) {
     if (map.delete(keyOf(chatId, threadId, mode))) removed += 1;
   }
   if (removed) persist(map);

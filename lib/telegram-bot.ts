@@ -1,4 +1,17 @@
 import { getActiveExcludeKeywords, predictMarketUrl, selectEligibleGroups } from './predict-markets';
+import {
+  analyzeCategoryBySlugOrUrl,
+  formatCategoryReport,
+  formatScanReport,
+  getNegRiskStatus,
+  getNegRiskThreshold,
+  isNegRiskAlertsEnabled,
+  registerNegRiskSendFn,
+  scanConvertibleCategories,
+  setNegRiskAlertsEnabled,
+  setNegRiskThreshold
+} from './negrisk';
+import { findPredictUrl } from './predict-url';
 import { getCacheStatus, getMarketsCachedOrFetch, refreshMarketsCache } from './predict-cache';
 import {
   addSubscriber,
@@ -179,10 +192,12 @@ function fmtRemaining(endMs?: number | null): string {
 const MENU_KEYBOARD = {
   inline_keyboard: [
     [{ text: '📊 Predict 独有市场（在派 PP）', callback_data: 'predict_only_all' }],
+    [{ text: '🔁 可转换市场 · Yes买1 总和扫描', callback_data: 'yes_check' }],
     [
       { text: '🔔 订阅·Predict独有', callback_data: 'subscribe_predict_only' },
       { text: '🔔 订阅·全部(含Poly)', callback_data: 'subscribe_all' }
     ],
+    [{ text: '🔔 订阅·Yes总和提醒', callback_data: 'subscribe_negrisk' }],
     [{ text: '🔕 取消本话题订阅', callback_data: 'unsubscribe' }],
     [{ text: '🔄 强制刷新缓存', callback_data: 'refresh_cache' }],
     [{ text: '🚨 立即跑一次价差检查', callback_data: 'check_spreads' }],
@@ -196,12 +211,24 @@ async function handleRefreshCache(chatId: number | string, threadId: number | nu
 }
 
 function modeLabel(mode: SubMode): string {
-  return mode === 'all' ? '全部(含Poly)' : 'Predict独有';
+  if (mode === 'all') return '全部(含Poly)';
+  if (mode === 'negrisk') return 'Yes总和提醒';
+  return 'Predict独有';
 }
 
 async function handleSubscribe(chatId: number | string, threadId: number | null, chatType: string, mode: SubMode) {
   const added = addSubscriber(chatId, threadId, mode);
   const loc = threadId ? `\n话题 thread_id: ${threadId}` : '';
+  if (mode === 'negrisk') {
+    await reply(
+      chatId,
+      threadId,
+      added
+        ? `✅ 已订阅【Yes总和提醒】\n\nchat id: ${chatId}（${chatType}）${loc}\n\n可转换(NegRisk)类目里所有结果的 Yes 买1 加起来 ≥ ${getNegRiskThreshold()}¢ 时推送到${threadId ? '这个话题' : '这里'}。\n改阈值: /yes_threshold 101\n取消: /unsubscribe`
+        : `这个${threadId ? '话题' : 'chat'}已经订阅【Yes总和提醒】了。\nchat id: ${chatId}${loc}`
+    );
+    return;
+  }
   const scope = mode === 'all' ? '所有新市场（含 polymarket 也有的）' : '新的 Predict 独有市场';
   const extra =
     mode === 'all'
@@ -447,12 +474,87 @@ async function handleStatus(chatId: number | string, threadId: number | null) {
   if (cache.lastError) lines.push(`缓存错误: ${cache.lastError}`);
   lines.push('');
   lines.push(`🔔 新市场提醒`);
-  lines.push(`订阅总数: ${subs.length}（Predict独有 ${subs.filter((s) => s.mode === 'predict_only').length} / 全部 ${subs.filter((s) => s.mode === 'all').length}）`);
+  lines.push(`订阅总数: ${subs.length}（Predict独有 ${subs.filter((s) => s.mode === 'predict_only').length} / 全部 ${subs.filter((s) => s.mode === 'all').length} / Yes总和 ${subs.filter((s) => s.mode === 'negrisk').length}）`);
   lines.push(`噪音过滤词: ${getActiveExcludeKeywords().join(', ') || '(已关闭)'}`);
   lines.push(`· Predict独有: ${watcher.predictOnly.initialized ? '✅' : '⏳'} 已知 ${watcher.predictOnly.knownEvents}${watcher.predictOnly.lastNewAt ? `，上次新发现 ${watcher.predictOnly.lastNewAt}（${watcher.predictOnly.lastNewCount}）` : ''}`);
   lines.push(`· 全部: ${watcher.all.initialized ? '✅' : '⏳'} 已知 ${watcher.all.knownEvents}${watcher.all.lastNewAt ? `，上次新发现 ${watcher.all.lastNewAt}（${watcher.all.lastNewCount}）` : ''}`);
+  const nr = getNegRiskStatus();
+  lines.push('');
+  lines.push(`🔁 可转换市场 Yes 总和检查`);
+  lines.push(`提醒: ${nr.enabled ? '✅ 开启' : '🔕 关闭'} · 阈值 ${nr.thresholdCents}¢ · 每 ${Math.round(nr.intervalMs / 60000)} 分钟 · cooldown ${nr.cooldownSec}s · 定时器 ${nr.timerActive ? '运行中' : '未启动'}`);
+  lines.push(`订阅话题: ${nr.subscribers}${nr.subscribers ? '' : '（无，发到 TELEGRAM_CHAT_ID）'}`);
+  if (nr.lastCycle) {
+    const c = nr.lastCycle;
+    lines.push(
+      `上次扫描: ${c.at} · 候选 ${c.candidates} / 预过滤 ${c.prefiltered} / 查询 ${c.scanned} · ${c.requests} 次请求 ${Math.round(c.durationMs / 1000)}s · 达标 ${c.hits} · 已推送 ${c.alertsSent}`
+    );
+    if (c.topSum != null) lines.push(`最高: ${c.topSum.toFixed(1)}¢ ${c.topTitle}`);
+    if (c.detectMode) lines.push(`判定: ${c.detectMode === 'flag' ? '接口 isNegRisk' : '启发式(≥3 结果)'}`);
+    if (c.error) lines.push(`扫描错误: ${c.error}`);
+  } else {
+    lines.push('上次扫描: (尚未)');
+  }
   if (globalThis.__tgBotLastError) lines.push(`Bot 错误: ${globalThis.__tgBotLastError}`);
   await reply(chatId, threadId, lines.join('\n'));
+}
+
+// ---------- 可转换市场 / Yes 买1 总和 ----------
+
+async function handleYes(chatId: number | string, threadId: number | null, input: string) {
+  const target = (input || '').trim();
+  if (!target) {
+    await reply(
+      chatId,
+      threadId,
+      '用法: /yes <predict.fun 链接或 slug>\n例: /yes https://predict.fun/market/xxx\n直接把链接发给我也可以。'
+    );
+    return;
+  }
+  await reply(chatId, threadId, '⏳ 正在查每个结果的 Yes 订单簿...');
+  try {
+    const a = await analyzeCategoryBySlugOrUrl(target);
+    await replyLong(chatId, threadId, formatCategoryReport(a, getNegRiskThreshold()));
+  } catch (err) {
+    await reply(chatId, threadId, `❌ 查询失败: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function handleYesCheck(chatId: number | string, threadId: number | null) {
+  await reply(chatId, threadId, '⏳ 正在扫描全部可转换类目（按结果数可能要几十秒）...');
+  try {
+    const scan = await scanConvertibleCategories();
+    await replyLong(chatId, threadId, formatScanReport(scan, 10));
+  } catch (err) {
+    await reply(chatId, threadId, `❌ 扫描失败: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function handleYesThreshold(chatId: number | string, threadId: number | null, args: string[]) {
+  const current = getNegRiskThreshold();
+  if (!args.length) {
+    await reply(chatId, threadId, `当前阈值: ${current}¢（所有结果 Yes 买1 之和 ≥ 这个值就提醒）\n设置: /yes_threshold 101`);
+    return;
+  }
+  const raw = args[0].replace(/[¢%,，]/g, '');
+  const set = setNegRiskThreshold(Number(raw));
+  if (set == null) {
+    await reply(chatId, threadId, `❌ 阈值无效: ${args[0]}（要 0-1000 之间的数字，单位 ¢）`);
+    return;
+  }
+  await reply(chatId, threadId, `✅ 阈值已改为 ${set}¢（原 ${current}¢）\n${isNegRiskAlertsEnabled() ? '' : '⚠️ 提醒当前是关闭的，/yes_on 开启'}`.trim());
+}
+
+async function handleYesToggle(chatId: number | string, threadId: number | null, enabled: boolean) {
+  const r = setNegRiskAlertsEnabled(enabled);
+  await reply(
+    chatId,
+    threadId,
+    r.changed
+      ? enabled
+        ? `✅ Yes 总和提醒已开启（阈值 ${getNegRiskThreshold()}¢）`
+        : '🔕 Yes 总和提醒已关闭（扫描继续跑，/status 能看结果，但不推送）'
+      : `Yes 总和提醒本来就是${enabled ? '开启' : '关闭'}的。`
+  );
 }
 
 async function handleHelp(chatId: number | string, threadId: number | null) {
@@ -467,6 +569,11 @@ async function handleHelp(chatId: number | string, threadId: number | null) {
     '/unsubscribe - 取消本话题全部订阅',
     '/subscribers - 查看订阅列表',
     '/id - 查看当前 chat id 和 thread_id',
+    '/yes <链接> - 查该类目所有结果的 Yes 买1 并求和（直接发链接也行）',
+    '/yes_check - 扫描全部可转换类目，列出 Yes 买1 总和最高的',
+    '/yes_threshold [数值] - 查看/设置提醒阈值（¢，默认 100）',
+    '/yes_on /yes_off - 开关 Yes 总和提醒',
+    '/subscribe_yes - 本话题订阅 Yes 总和提醒',
     '/check - 立即跑一次价差检查',
     '/spread_off - 关闭价差提醒（监控继续跑但不推送）',
     '/spread_on - 重新开启价差提醒',
@@ -514,6 +621,34 @@ async function handleCommand(
       await handlePredictOnly(chatId, threadId, !includeZeroPP);
       return;
     }
+    case '/yes':
+    case '/negrisk':
+    case '/convert':
+      await handleYes(chatId, threadId, args.join(' '));
+      return;
+    case '/yes_check':
+    case '/yescheck':
+    case '/negrisk_check':
+      await handleYesCheck(chatId, threadId);
+      return;
+    case '/yes_threshold':
+    case '/yesthreshold':
+    case '/threshold':
+      await handleYesThreshold(chatId, threadId, args);
+      return;
+    case '/yes_on':
+    case '/yeson':
+      await handleYesToggle(chatId, threadId, true);
+      return;
+    case '/yes_off':
+    case '/yesoff':
+      await handleYesToggle(chatId, threadId, false);
+      return;
+    case '/subscribe_yes':
+    case '/subscribeyes':
+    case '/subscribe_negrisk':
+      await handleSubscribe(chatId, threadId, chatType, 'negrisk');
+      return;
     case '/check':
     case '/spreads':
       await handleCheckSpreads(chatId, threadId);
@@ -565,6 +700,12 @@ async function handleCallback(query: TgCallbackQuery) {
       break;
     case 'subscribe_all':
       await handleSubscribe(chatId, threadId, chatType, 'all');
+      break;
+    case 'subscribe_negrisk':
+      await handleSubscribe(chatId, threadId, chatType, 'negrisk');
+      break;
+    case 'yes_check':
+      await handleYesCheck(chatId, threadId);
       break;
     case 'unsubscribe':
       await handleUnsubscribe(chatId, threadId);
@@ -624,6 +765,12 @@ async function handleUpdate(update: TgUpdate) {
     await handleCommand(chatId, threadId, tokens[0], tokens.slice(1), chatType);
     return;
   }
+  // 直接发 predict.fun 链接 → 当作 /yes 查询
+  const url = findPredictUrl(text);
+  if (url) {
+    await handleYes(chatId, threadId, url);
+    return;
+  }
   await sendMenu(chatId, threadId);
 }
 
@@ -633,6 +780,10 @@ async function registerCommandsMenu() {
       commands: [
         { command: 'menu', description: '主菜单' },
         { command: 'predict_only', description: 'Predict 独有市场（在派 PP）' },
+        { command: 'yes', description: '查链接类目的 Yes 买1 总和' },
+        { command: 'yes_check', description: '扫描可转换类目 Yes 买1 总和' },
+        { command: 'yes_threshold', description: '查看/设置 Yes 总和提醒阈值' },
+        { command: 'subscribe_yes', description: '订阅 Yes 总和提醒' },
         { command: 'subscribe', description: '订阅 Predict 独有新市场' },
         { command: 'subscribe_all', description: '订阅全部新市场(含Poly)' },
         { command: 'unsubscribe', description: '取消本话题订阅' },
@@ -663,6 +814,7 @@ export function startBotLongPolling(): void {
   console.log(`[bot] starting long polling — instance=${INSTANCE_ID} version=${CODE_VERSION} started=${INSTANCE_STARTED}`);
 
   registerAlertSendFn(sendTextToChat);
+  registerNegRiskSendFn(sendTextToChat);
   void registerCommandsMenu();
 
   const loop = async () => {
